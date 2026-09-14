@@ -9,14 +9,29 @@ forceNamespace:
 nameOverride: ""
 fullnameOverride: ""
 
+metrics:
+  enabled: false
+
+restartExistWorkloads:
+  enabled: true
+
+bpfExclusiveMode:
+  enabled: false
+
 appArmorLsmEnforcer:
   enabled: true
 
 bpfLsmEnforcer:
   enabled: false
 
-restartExistWorkloads:
+behaviorModeling:
+  enabled: false
+
+serviceEgressControl:
   enabled: true
+
+podEgressControl:
+  enabled: false
 
 unloadAllAaProfiles:
   enabled: false
@@ -24,12 +39,141 @@ unloadAllAaProfiles:
 removeAllSeccompProfiles:
   enabled: false
 
-bpfExclusiveMode:
+jsonLogFormat:
   enabled: false
+  args:
+  - --logFormat=json
 
-# [Experimental feature]
-behaviorModeling:
-  enabled: false
+auditEventMetadata:
+  # The metadata is used to enrich the audit events.
+  # It can be used to add additional information to the audit events.
+  # For example, you can add the cluster id, name, region, or any other information that is relevant to your environment.
+  # clusterID: "ccvbve8igndqr18dnk0vg"
+  # clusterName: "production-cluster-1"
+  # region: "cn-beijing"
+
+# NetworkProxy enforcer audit-log reporting. The injected Envoy sidecar always
+# streams its deny/shadow access logs over a Unix domain socket to the
+# node-local agent's ALS server, which normalises them into the shared
+# violations.log pipeline.
+audit:
+  networkProxy:
+    # envoyAlsBuffer bounds the sidecar's in-memory gRPC access-log buffer so
+    # audit load can never back-pressure egress forwarding (drop, never block).
+    # Conservative defaults favour dropping over unbounded buffering. Tune up
+    # for large rule sets / high violation rates.
+    envoyAlsBuffer:
+      # flushInterval is the max time Envoy buffers entries before flushing
+      # them to the agent (Envoy duration string, e.g. "1s"). Empty omits the
+      # field and lets Envoy use its own default.
+      flushInterval: "1s"
+      # bufferSizeBytes caps the in-memory buffer, per access_log entry. Once
+      # exceeded Envoy flushes early (before flushInterval); under sustained
+      # overload it drops rather than growing without bound. 0 omits the field.
+      # A sidecar renders one entry per deny/shadow log per chain (4 entries
+      # without MITM, 8 with MITM), so the worst-case total buffer is
+      # entries x bufferSizeBytes (~0.5Mi at 64Ki with MITM) -- ~0.1% of the
+      # sidecar memory limit, hence negligible. Default 64Ki holds roughly a
+      # hundred-plus records per entry; raise for large rule sets / high
+      # violation rates (calibrate against the sidecar memory limit).
+      bufferSizeBytes: 65536
+
+# dynamicConfig populates the varmor-config ConfigMap, vArmor's runtime-reloadable
+# configuration (see templates/configmap.yaml). The manager watches it via an
+# informer and applies changes without a restart.
+dynamicConfig:
+  # microVMDetection tells the NetworkProxy injector which workloads run under a
+  # micro-VM runtime. For those, the ALS socket hostPath is omitted and the
+  # in-sidecar audit sink binds the socket locally. A workload matches if its
+  # runtimeClassName is in runtimeClassNames OR any annotation rule matches OR
+  # any label rule matches.
+  microVMDetection:
+    # RuntimeClass names that indicate a kata / micro-VM sandbox.
+    runtimeClassNames:
+    - kata
+    - kata-qemu
+    - kata-clh
+    # Vendor annotations that indicate a serverless / micro-VM sandbox. An empty
+    # value matches on key presence alone; a non-empty value must match exactly.
+    annotations:
+    # Volcengine VKE burst-to-VCI (serverless), enforce mode.
+    - key: vke.volcengine.com/burst-to-vci
+      value: enforce
+    # Vendor labels that indicate a serverless / micro-VM sandbox. An empty value
+    # matches on key presence alone; a non-empty value must match exactly.
+    labels:
+    # Volcengine VKE burst-to-VCI (serverless), enforce mode.
+    - key: vke.volcengine.com/burst-to-vci
+      value: enforce
+    # Alibaba Cloud ECI: opt a Pod into the elastic container instance (micro-VM)
+    # runtime via a Pod label.
+    - key: alibabacloud.com/eci
+      value: "true"
+
+  # networkProxy holds cluster-wide defaults for the NetworkProxy (Envoy) sidecar.
+  # defaultResources sets the cluster-level default resource requests/limits for
+  # the injected sidecar container. The injector resolves the final resources with
+  # a three-layer, field-level merge chain: per-policy override > this cluster-
+  # global config > built-in defaults. Each leaf value (requests.cpu/memory,
+  # limits.cpu/memory) falls back independently, so a partial config below only
+  # overrides the fields it sets; everything unset keeps the built-in defaults.
+  #
+  # Two independent, MITM-aware tiers are supported: nonMitm applies to non-MITM
+  # sidecars; mitm applies to MITM sidecars, which run heavier due to double TLS
+  # handshakes. Leave a block empty (as shipped) to keep the built-in defaults
+  # for that tier.
+  #
+  # IMPORTANT: the two tiers are independent, NOT inherited. A MITM sidecar reads
+  # ONLY the mitm tier and a non-MITM sidecar reads ONLY the nonMitm tier. So to
+  # raise resources for MITM workloads you must set the mitm block explicitly;
+  # setting only nonMitm leaves MITM sidecars on their built-in defaults, and
+  # vice versa.
+  #
+  # IMPORTANT: the tier keys must be spelled EXACTLY "nonMitm" and "mitm" (the
+  # embedded config is parsed leniently). A misspelled tier key (e.g. "nonMITM",
+  # "non-mitm", "Mitm") is silently ignored -- that tier falls back to the
+  # built-in defaults with NO warning, since only the entries INSIDE a tier are
+  # validated at load time, not the tier key itself.
+  #
+  # IMPORTANT: always quote quantities as strings (e.g. cpu: "500m", memory:
+  # "256Mi"). An unquoted bare number is parsed by YAML as an integer, so
+  # `memory: 100` means 100 BYTES, not 100Mi. Unquoted suffixed values (500m,
+  # 256Mi) are fine because YAML already reads them as strings, but quoting
+  # everything is the safe habit.
+  #
+  # Invalid entries are ignored (that field falls back to its built-in default)
+  # and logged by the manager at load time: an unknown resource name (only cpu
+  # and memory are supported), an unparseable quantity, or a non-positive value
+  # (zero or negative). A limit set below its request in the same tier is also
+  # warned about (the kube-apiserver would otherwise reject the sidecar Pod).
+  #
+  # Built-in defaults for reference:
+  #   non-MITM  requests: cpu 50m,  memory 64Mi   limits: cpu 500m,  memory 256Mi
+  #   MITM      requests: cpu 100m, memory 128Mi  limits: cpu 1000m, memory 512Mi
+  networkProxy:
+    defaultResources:
+      # Non-MITM sidecar defaults. Example (quote every quantity):
+      #   nonMitm:
+      #     requests:
+      #       cpu: "50m"
+      #       memory: "64Mi"
+      #     limits:
+      #       cpu: "500m"
+      #       memory: "256Mi"
+      nonMitm:
+        requests: {}
+        limits: {}
+      # MITM sidecar defaults. Example (quote every quantity):
+      #   mitm:
+      #     requests:
+      #       cpu: "100m"
+      #       memory: "128Mi"
+      #     limits:
+      #       cpu: "1000m"
+      #       memory: "512Mi"
+      mitm:
+        requests: {}
+        limits: {}
 
 image:
   registry: ""
@@ -75,11 +219,62 @@ manager:
       - MKNOD
       - NET_RAW
 
+  network:
+    statusPort: 8080
+    webhookPort: 3443
+    metricsPort: 8081
+
   args: []
 
+  bpfLsmEnforcer:
+    args:
+    - --enableBpfEnforcer
+
   behaviorModeling:
+    # Set this to true to use a persistent volume for storing LocalDisk-type ArmorProfileModel objects.
+    # Different instances of the manager will share the same data to ensure compatibility of LocalDisk-type ArmorProfileModel objects.
+    # Note: You must first create a valid PVC named varmor-manager-apmdata-pvc in the same namespace as the manager pod.
+    usePersistentVolume: false
     args:
     - --enableBehaviorModeling
+    # The volume saves the ArmorProfileModel objects in the manager pod
+    volumeMounts:
+    - mountPath: /var/log/varmor/apmdata
+      name: apmdata
+    emptyDirVolume:
+      sizeLimit: 500Mi
+      name: apmdata
+    persistentVolume:
+      claimName: varmor-manager-apmdata-pvc
+      name: apmdata
+
+  serviceEgressControl:
+    args:
+    - --enableServiceEgressControl
+    clusterrules:
+    - apiGroups:
+      - ""
+      - "discovery.k8s.io"
+      resources:
+      - services
+      - endpointslices
+      verbs:
+      - get
+      - list
+      - watch
+
+  podEgressControl:
+    args:
+    - --enablePodEgressControl
+    clusterrules:
+    - apiGroups:
+      - ""
+      resources:
+      - pods
+      verbs:
+      - get
+      - list
+      - watch
 
   restartExistWorkloads:
     args:
@@ -89,13 +284,17 @@ manager:
     args:
     - --bpfExclusiveMode
 
+  metrics:
+    args:
+    - --enableMetrics
+
   resources:
     limits:
-      cpu: 200m
-      memory: 300Mi
+      cpu: "500m"
+      memory: "300Mi"
     requests:
-      cpu: 100m
-      memory: 200Mi
+      cpu: "100m"
+      memory: "200Mi"
 
   autoscaling:
     enabled: false
@@ -109,6 +308,20 @@ manager:
   affinity: {}
 
   tolerations: []
+
+  topologySpreadConstraints:
+  - labelSelector:
+      matchLabels:
+        app.kubernetes.io/component: varmor-manager
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+  - labelSelector:
+      matchLabels:
+        app.kubernetes.io/component: varmor-manager
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
 
 
 agent:
@@ -134,8 +347,20 @@ agent:
     tag: ""
   
   securityContext:
-    privileged: true
+    capabilities:
+      add:
+      - SYS_ADMIN
+      - BPF
+      - SYS_RESOURCE
+      - SYS_PTRACE
+      - MAC_ADMIN
+      - IPC_LOCK
     runAsUser: 0
+
+  network:
+    hostNetwork: false
+    dnsPolicy: ClusterFirstWithHostNet
+    readinessPort: 9580
 
   args: []
 
@@ -156,22 +381,22 @@ agent:
       name: apparmor-dir
     resources:
       limits:
-        cpu: 200m
-        memory: 100Mi
+        cpu: "1"
+        memory: "300Mi"
       requests:
-        cpu: 100m
-        memory: 40Mi
+        cpu: "100m"
+        memory: "100Mi"
 
   bpfLsmEnforcer:
     args:
     - --enableBpfEnforcer
     resources:
       limits:
-        cpu: 200m
-        memory: 200Mi
+        cpu: "1"
+        memory: "400Mi"
       requests:
-        cpu: 100m
-        memory: 100Mi
+        cpu: "100m"
+        memory: "100Mi"
 
   unloadAllAaProfiles:
     args:
@@ -184,43 +409,37 @@ agent:
   behaviorModeling:
     args:
     - --enableBehaviorModeling
+    # The volume caches the audit data in the agent pod during modeling
     volumeMounts:
-    - mountPath: /var/run/varmor/audit
-      name: audit-dir
+    - mountPath: /var/log/varmor/auditdata
+      name: auditdata
     volumes:
-    - hostPath:
-        path: /var/run/varmor/audit
-        type: DirectoryOrCreate
-      name: audit-dir
+    - emptyDir:
+        sizeLimit: 500Mi
+      name: auditdata
     resources:
       limits:
-        cpu: 2
-        memory: 2Gi
+        cpu: "2"
+        memory: "2Gi"
       requests:
-        cpu: 500m
-        memory: 500Mi
+        cpu: "500m"
+        memory: "500Mi"
 
   bpfRelated:
     volumeMounts:
+    - mountPath: /sys/fs/bpf
+      name: bpffs
     - mountPath: /sys/kernel/btf/vmlinux
       name: btf
-    - mountPath: /run/containerd/
-      name: containerd    
-    - mountPath: /proc
-      name: procfs
     volumes:
+    - hostPath:
+        path: /sys/fs/bpf
+        type: Directory
+      name: bpffs
     - hostPath:
         path: /sys/kernel/btf/vmlinux
         type: File
       name: btf
-    - hostPath:
-        path: /run/containerd/
-        type: Directory
-      name: containerd
-    - hostPath:
-        path: /proc
-        type: Directory
-      name: procfs
 
   nodeSelector: {}
 
@@ -275,17 +494,16 @@ classifier:
       - MKNOD
       - NET_RAW
 
-  resources: {}
-    # We usually recommend not to specify default resources and to leave this as a conscious
-    # choice for the user. This also increases chances charts run on environments with little
-    # resources, such as Minikube. If you do want to specify resources, uncomment the following
-    # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-    # limits:
-    #   cpu: 100m
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+  network:
+    servicePort: 5000
+
+  resources: 
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+    requests:
+      cpu: "500m"
+      memory: "500Mi"
 
   autoscaling:
     enabled: false
@@ -299,3 +517,12 @@ classifier:
   affinity: {}
 
   tolerations: []
+
+networkproxy:
+  image:
+    init:
+      name: proxyinit
+      tag: v0.2
+    proxy:
+      name: envoy
+      tag: v1.38-latest

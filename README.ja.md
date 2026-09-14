@@ -4,7 +4,7 @@
         <img src="docs/img/logo-dark.svg" alt="Logo" width="400">
     </picture>
 </div>
-<br>
+<br />
 
 ![BHArsenalUSA2024](docs/img/BlackHat-Arsenal-USA-2024.svg)
 [![Go Report Card](https://goreportcard.com/badge/github.com/bytedance/vArmor)](https://goreportcard.com/report/github.com/bytedance/vArmor)
@@ -33,7 +33,9 @@ vArmorは、ByteDanceのエンドポイントセキュリティ部門の**Elkeid
 *注意: 厳格な隔離要件を満たすためには、計算隔離のためにハードウェア仮想化コンテナ（例：Kata Containers）を優先的に使用し、CNIのNetworkPolicyによるネットワーク隔離と組み合わせることをお勧めします。*
 
 ## アーキテクチャ
-<img src="docs/img/architecture.png" width="600">
+<div style="text-align: center;">
+  <img src="docs/img/architecture.svg" width="600">
+</div>
 
 ## 前提条件
 ポリシーオブジェクト（[VarmorPolicy](docs/usage_instructions.md#varmorpolicy)/[VarmorClusterPolicy](docs/usage_instructions.md#varmorclusterpolicy)）の`spec.policy.enforcer`フィールドを使用してエンフォーサーを指定できます。さらに、異なるエンフォーサーを個別または組み合わせて使用することもできます。例：AppArmorBPF、AppArmorSeccomp、AppArmorBPFSeccompなど。
@@ -42,8 +44,8 @@ vArmorは、ByteDanceのエンドポイントセキュリティ部門の**Elkeid
 
 |エンフォーサー|要件|推奨|
 |------------|--------------------------------------------|--------|
-|AppArmor    |1. Linux Kernel 4.15以上<br>2. AppArmor LSMが有効化されていること|GKE with Container-Optimized OS<br>AKS with Ubuntu 22.04 LTS<br>[VKE](https://www.volcengine.com/product/vke) with veLinux 1.0<br>Debian 10以上<br>Ubuntu 18.04.0 LTS以上<br>[veLinux 1.0](https://www.volcengine.com/docs/6396/74967)など|
-|BPF         |1. Linux Kernel 5.10以上 (x86_64)<br>2. containerd v1.6.0以上<br>3. BPF LSMが有効化されていること|EKS with Amazon Linux 2<br>GKE with Container-Optimized OS<br>[VKE](https://www.volcengine.com/product/vke) with veLinux 1.0 (with 5.10 kernel)<br>AKS with Ubuntu 22.04 LTS <sup>\*</sup><br>ACK with Alibaba Cloud Linux 3 <sup>\*</sup><br>OpenSUSE 15.4 <sup>\*</sup><br>Debian 11 <sup>\*</sup><br>Fedora 37 <br>[veLinux 1.0 with 5.10 kernel](https://www.volcengine.com/docs/6396/74967)など<br><br>* *BPF LSMの手動有効化が必要です*|
+|AppArmor    |1. Linux Kernel 4.15以上<br />2. AppArmor LSMが有効化されていること|GKE with Container-Optimized OS<br />AKS with Ubuntu 22.04 LTS<br />[VKE](https://www.volcengine.com/product/vke) with veLinux 1.0<br />Debian 10以上<br />Ubuntu 18.04.0 LTS以上<br />[veLinux 1.0](https://www.volcengine.com/docs/6396/74967)など|
+|BPF         |1. Linux Kernel 5.10以上 (x86_64)<br />2. containerd v1.6.0以上<br />3. BPF LSMが有効化されていること|EKS with Amazon Linux 2<br />GKE with Container-Optimized OS<br />[VKE](https://www.volcengine.com/product/vke) with veLinux 1.0 (with 5.10 kernel)<br />AKS with Ubuntu 22.04 LTS <sup>\*</sup><br />ACK with Alibaba Cloud Linux 3 <sup>\*</sup><br />OpenSUSE 15.4 <sup>\*</sup><br />Debian 11 <sup>\*</sup><br />Fedora 37 <br />[veLinux 1.0 with 5.10 kernel](https://www.volcengine.com/docs/6396/74967)など<br /><br />* *BPF LSMの手動有効化が必要です*|
 |Seccomp     |1. Kubernetes v1.19以上|すべてのLinuxディストリビューション|
 
 ## ポリシーモードと組み込みルール
@@ -58,13 +60,13 @@ vArmorポリシーは、**AlwaysAllow、RuntimeDefault、EnhanceProtect、Behavi
 
 ### ステップ1. チャートの取得
 ```
-helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.5.11
+helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.4
 ```
 
 ### ステップ2. インストール
 *中国地域内では、ドメイン`elkeid-cn-beijing.cr.volces.com`を使用できます。*
 ```
-helm install varmor varmor-0.5.11.tgz \
+helm install varmor varmor-0.10.4.tgz \
     --namespace varmor --create-namespace \
     --set image.registry="elkeid-ap-southeast-1.cr.volces.com"
 ```
@@ -123,7 +125,7 @@ vArmorは、eBPFプログラムを管理および操作するために[cilium/eb
 vArmorは、[Nirmata](https://nirmata.com/)によって開発された[kyverno](https://github.com/kyverno/kyverno)の一部のコードを参照しています。
 
 ## デモ
-以下は、vArmorを使用してDeploymentを強化し、CVE-2021-22555に対抗するデモンストレーションです。（エクスプロイトは[cve-2021-22555](https://github.com/google/security-research/tree/master/pocs/linux/cve-2021-22555)から変更されています）<br>
+以下は、vArmorを使用してDeploymentを強化し、CVE-2021-22555に対抗するデモンストレーションです。（エクスプロイトは[cve-2021-22555](https://github.com/google/security-research/tree/master/pocs/linux/cve-2021-22555)から変更されています）<br />
 ![image](test/demos/CVE-2021-22555/demo.gif)
 
 ## 404Starlink

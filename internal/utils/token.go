@@ -28,9 +28,10 @@ var (
 	token      string
 	mu         sync.RWMutex
 	updateChan chan bool
-	AgentReady int32 = 0
 )
 
+// InitAndStartTokenRotation initializes and starts the token rotation.
+// The token is used for authenticating with the manager.
 func InitAndStartTokenRotation(interval time.Duration, logger logr.Logger) {
 	updateToken(BindTokenPath, logger)
 	updateChan = make(chan bool)

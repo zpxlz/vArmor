@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package utils implements the utils for vArmor.
 package utils
 
 import (
@@ -22,10 +23,10 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"os"
+	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,146 +35,123 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/util/retry"
 
-	varmorconfig "github.com/bytedance/vArmor/internal/config"
+	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
+	varmorinterface "github.com/bytedance/vArmor/pkg/client/clientset/versioned/typed/varmor/v1beta1"
 )
 
 const (
-	httpTimeout    = 3 * time.Second
-	retryTimes     = 5
-	httpsServerURL = "https://%s.%s:%d%s"
-	httpsDebugURL  = "https://%s:%d%s"
-	serverURL      = "http://%s.%s:%d%s"
-	debugServerURL = "http://%s:%d%s"
+	httpTimeout = 40 * time.Second
+	retryTimes  = 3
 )
 
-func httpsPostWithRetryAndToken(reqBody []byte, debug bool, service string, namespace string, address string, port int, path string, retryTimes int) error {
-	var url string
-	if debug {
-		url = fmt.Sprintf(httpsDebugURL, address, port, path)
-	} else {
-		url = fmt.Sprintf(httpsServerURL, service, namespace, port, path)
-	}
+var (
+	httpClient *http.Client
+	httpOnce   sync.Once
+)
+
+func initHTTPClient() {
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		DisableKeepAlives: false,
+		MaxIdleConns:      10,
+		IdleConnTimeout:   200 * time.Second,
 	}
-	client := &http.Client{Timeout: httpTimeout, Transport: tr}
-	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Token", GetToken())
-	var httpRsp *http.Response
 
-	for i := 0; i < retryTimes; i++ {
-		httpRsp, err = client.Do(httpReq)
+	httpClient = &http.Client{
+		Timeout:   httpTimeout,
+		Transport: tr,
+	}
+}
+
+func HTTPSPostWithRetryAndToken(address string, path string, reqBody []byte, inContainer bool) error {
+	httpOnce.Do(initHTTPClient)
+
+	url := fmt.Sprintf("https://%s%s", address, path)
+
+	var lastErr error
+	for retry := 0; retry < retryTimes; retry++ {
+		httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 		if err == nil {
-			defer httpRsp.Body.Close()
-			switch httpRsp.StatusCode {
-			case http.StatusOK:
-				return nil
-			case http.StatusUnauthorized:
-				if !debug {
-					// try update token
-					updateChan <- true
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Token", GetToken())
+
+			httpRsp, err := httpClient.Do(httpReq)
+			if err == nil {
+				switch httpRsp.StatusCode {
+				case http.StatusOK:
+					httpRsp.Body.Close()
+					return nil
+				case http.StatusUnauthorized:
+					if inContainer {
+						// try to update token
+						updateChan <- true
+					}
+				default:
+					lastErr = fmt.Errorf("http error code %d", httpRsp.StatusCode)
 				}
-				return fmt.Errorf(fmt.Sprintf("http error code %d", httpRsp.StatusCode))
-			default:
-				err = fmt.Errorf(fmt.Sprintf("http error code %d", httpRsp.StatusCode))
-			}
-		}
-		r := rand.Intn(60) + 20
-		time.Sleep(time.Duration(r) * time.Millisecond)
-	}
-
-	return err
-}
-
-func httpPostWithRetry(reqBody []byte, debug bool, service string, namespace string, address string, port int, path string, retryTimes int) error {
-	var url string
-	if debug {
-		url = fmt.Sprintf(debugServerURL, address, port, path)
-	} else {
-		url = fmt.Sprintf(serverURL, service, namespace, port, path)
-	}
-	client := &http.Client{Timeout: httpTimeout}
-	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	var httpRsp *http.Response
-
-	for i := 0; i < retryTimes; i++ {
-		httpRsp, err = client.Do(httpReq)
-		if err == nil {
-			defer httpRsp.Body.Close()
-			if httpRsp.StatusCode == http.StatusOK {
-				return nil
+				httpRsp.Body.Close()
 			} else {
-				err = fmt.Errorf(fmt.Sprintf("http error code %d", httpRsp.StatusCode))
+				lastErr = err
 			}
+		} else {
+			lastErr = err
 		}
-		r := rand.Intn(60) + 20
-		time.Sleep(time.Duration(r) * time.Millisecond)
+
+		backoff := time.Duration(1<<uint(retry)) * time.Second
+		jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+		time.Sleep(backoff + jitter)
 	}
 
-	return err
+	return lastErr
 }
 
-func httpPostAndGetResponseWithRetry(reqBody []byte, debug bool, service string, namespace string, address string, port int, path string, retryTimes int) ([]byte, error) {
-	var url string
-	if debug {
-		url = fmt.Sprintf(debugServerURL, address, port, path)
-	} else {
-		url = fmt.Sprintf(serverURL, service, namespace, port, path)
-	}
+func HTTPPostAndGetResponseWithRetry(address string, path string, reqBody []byte) ([]byte, error) {
+	url := fmt.Sprintf("http://%s%s", address, path)
+
 	client := &http.Client{Timeout: httpTimeout}
-	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	var httpRsp *http.Response
-	for i := 0; i < retryTimes; i++ {
-		httpRsp, err = client.Do(httpReq)
+
+	var lastErr error
+	for retry := 0; retry < retryTimes; retry++ {
+		httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 		if err == nil {
-			defer httpRsp.Body.Close()
-			if httpRsp.StatusCode == http.StatusOK {
-				rspBody := make([]byte, len(reqBody))
-				var n int
-				n, err = httpRsp.Body.Read(rspBody)
-				if n > 0 && err == io.EOF {
-					return rspBody, nil
+			httpReq.Header.Set("Content-Type", "application/json")
+
+			httpRsp, err := client.Do(httpReq)
+			if err == nil {
+				if httpRsp.StatusCode == http.StatusOK {
+					rspBody := make([]byte, len(reqBody))
+					var n int
+					n, err = httpRsp.Body.Read(rspBody)
+					if n > 0 && err == io.EOF {
+						httpRsp.Body.Close()
+						return rspBody, nil
+					}
+				} else {
+					lastErr = fmt.Errorf("http error code %d", httpRsp.StatusCode)
 				}
+				httpRsp.Body.Close()
 			} else {
-				err = fmt.Errorf(fmt.Sprintf("http error code %d", httpRsp.StatusCode))
+				lastErr = err
 			}
+		} else {
+			lastErr = err
 		}
-		r := rand.Intn(60) + 20
-		time.Sleep(time.Duration(r) * time.Millisecond)
+
+		backoff := time.Duration(1<<uint(retry)) * time.Second
+		jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+		time.Sleep(backoff + jitter)
 	}
 
-	return nil, err
+	return nil, lastErr
 }
 
-func RequestClassifierService(reqBody []byte, debug bool, address string, port int) ([]byte, error) {
-	return httpPostAndGetResponseWithRetry(reqBody, debug, varmorconfig.ClassifierServiceName, varmorconfig.Namespace, address, port, varmorconfig.ClassifierPathClassifyPath, retryTimes)
-}
-
-func PostStatusToStatusService(reqBody []byte, debug bool, address string, port int) error {
-	return httpsPostWithRetryAndToken(reqBody, debug, varmorconfig.StatusServiceName, varmorconfig.Namespace, address, port, varmorconfig.StatusSyncPath, retryTimes)
-}
-
-func PostDataToStatusService(reqBody []byte, debug bool, address string, port int) error {
-	return httpsPostWithRetryAndToken(reqBody, debug, varmorconfig.StatusServiceName, varmorconfig.Namespace, address, port, varmorconfig.DataSyncPath, retryTimes)
-}
-
-func TagLeaderPod(podInterface corev1.PodInterface) error {
+func TagLeaderPod(podInterface corev1.PodInterface, name string) error {
 	jsonPatch := `[{"op": "add", "path": "/metadata/labels/identity", "value": "leader"}]`
-	_, err := podInterface.Patch(context.Background(), os.Getenv("HOSTNAME"), types.JSONPatchType, []byte(jsonPatch), metav1.PatchOptions{})
+	_, err := podInterface.Patch(context.Background(), name, types.JSONPatchType, []byte(jsonPatch), metav1.PatchOptions{})
 
 	return err
 }
@@ -225,37 +203,31 @@ func InUint32Array(i uint32, array []uint32) bool {
 	return false
 }
 
-func SetAgentReady() {
-	atomic.StoreInt32(&AgentReady, 1)
-}
-
-func SetAgentUnready() {
-	atomic.StoreInt32(&AgentReady, 0)
-}
-
-func WaitForManagerReady(debug bool, address string, port int) {
-	var url string
-	if debug {
-		url = fmt.Sprintf(httpsDebugURL, address, port, "/healthz")
-	} else {
-		url = fmt.Sprintf(httpsServerURL, varmorconfig.StatusServiceName, varmorconfig.Namespace, port, "/healthz")
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
-	}
-
-	for {
-		resp, err := client.Get(url)
-		if err == nil && resp.StatusCode == 200 {
-			return
+func InUint16Array(i uint16, array []uint16) bool {
+	for _, v := range array {
+		if v == i {
+			return true
 		}
-		time.Sleep(2 * time.Second)
 	}
+	return false
+}
+
+func InPortRangeArray(i varmor.Port, array []varmor.Port) bool {
+	for _, v := range array {
+		if v.Port == i.Port && v.EndPort == i.EndPort {
+			return true
+		}
+	}
+	return false
+}
+
+func InNetworksArray(i varmor.NetworkContent, array []varmor.NetworkContent) bool {
+	for _, v := range array {
+		if reflect.DeepEqual(v, i) {
+			return true
+		}
+	}
+	return false
 }
 
 func GinLogger() gin.HandlerFunc {
@@ -291,4 +263,70 @@ func IsAppArmorGA(versionInfo *version.Info) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+func RemoveArmorProfileFinalizers(i varmorinterface.CrdV1beta1Interface, namespace, name string) error {
+	removeFinalizers := func() error {
+		ap, err := i.ArmorProfiles(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			if k8errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		ap.Finalizers = []string{}
+		_, err = i.ArmorProfiles(namespace).Update(context.Background(), ap, metav1.UpdateOptions{})
+		return err
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, removeFinalizers)
+}
+
+func IsRequestSizeError(err error) bool {
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "trying to send message larger than max") ||
+		strings.Contains(errMsg, "etcdserver: request is too large") ||
+		strings.Contains(errMsg, "Request entity too large") {
+		return true
+	}
+	return false
+}
+
+// GenerateLeaseUpdatePeriod generates the lease update period based on the number of nodes in the cluster.
+// The larger the cluster, the longer the lease update period to reduce the frequency of leader elections.
+func GenerateLeaseUpdatePeriod(kubeClient *kubernetes.Clientset) (time.Duration, time.Duration, time.Duration, error) {
+	nodes, err := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{
+		LabelSelector:   "node.kubernetes.io/instance-type!=virtual-node",
+		ResourceVersion: "0",
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	nodeCount := len(nodes.Items)
+	if nodeCount < 100 {
+		return 15 * time.Second, 10 * time.Second, 2 * time.Second, nil
+	} else if nodeCount < 1000 {
+		return 30 * time.Second, 20 * time.Second, 4 * time.Second, nil
+	} else if nodeCount < 5000 {
+		return 60 * time.Second, 50 * time.Second, 8 * time.Second, nil
+	} else {
+		return 90 * time.Second, 80 * time.Second, 8 * time.Second, nil
+	}
+}
+
+// GenerateStatusUpdateWindow generates status update batch window based on number of nodes in the cluster.
+// This is used to throttle status updates in large clusters to reduce API server load.
+// The larger the cluster, the longer the batch window to collect more status updates before processing.
+func GenerateStatusUpdateWindow(nodeCount int) time.Duration {
+	if nodeCount < 100 {
+		return 2 * time.Second // Small cluster, fast response
+	} else if nodeCount < 1000 {
+		return 5 * time.Second // Medium cluster
+	} else if nodeCount < 5000 {
+		return 10 * time.Second // Large cluster
+	} else if nodeCount < 8000 {
+		return 20 * time.Second // Extra-large cluster
+	} else {
+		return 30 * time.Second // Ultra-large cluster
+	}
 }

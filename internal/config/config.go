@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package config is used to store the configuration of vArmor
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -34,8 +36,11 @@ var (
 	// appArmorGA is true if the APIServer version is 1.30 and above
 	AppArmorGA = false
 
-	// Namespace is the vArmor namespace
-	Namespace = getNamespace()
+	// Name is the name of Pod that the vArmor is running in
+	Name = getPodName()
+
+	// Namespace is the namespace of Pod that the vArmor is running in
+	Namespace = getPodNamespace()
 
 	// ManagerName is the deployment name of vArmor manager
 	ManagerName = "varmor-manager"
@@ -44,7 +49,7 @@ var (
 	AgentName = "varmor-agent"
 
 	// AgentReadinessPort is the port of agent service
-	AgentServicePort = 6080
+	AgentReadinessPort = getAgentReadinessPort()
 
 	// AgentReadinessPath is the path for checking readness health of agent
 	AgentReadinessPath = "/health/readiness"
@@ -56,7 +61,7 @@ var (
 	ClassifierServiceName = "varmor-classifier-svc"
 
 	// ClassifierServicePort is the port of classification service
-	ClassifierServicePort = 5000
+	ClassifierServicePort = getClassifierServicePort()
 
 	// ClassifierPathClassifyPath is the path for classifing path
 	ClassifierPathClassifyPath = "/api/v1/path"
@@ -65,19 +70,25 @@ var (
 	StatusServiceName = "varmor-status-svc"
 
 	// StatusServicePort is the port of status service
-	StatusServicePort = 8080
+	StatusServicePort = getStatusServicePort()
 
 	// StatusSyncPath is the path for syncing status
-	StatusSyncPath = "/api/v1/status"
+	StatusSyncPath = "/apis/v1/status"
 
 	// DataSyncPath is the path for syncing data
-	DataSyncPath = "/api/v1/data"
+	DataSyncPath = "/apis/v1/data"
+
+	// ArmorProfileModelPath is the path for exporting the complete ArmorProfileModel object
+	ArmorProfileModelPath = "/namespaces/:namespace/armorprofilemodels/:name"
 
 	// WebhookServiceName is the name of webhook service
 	WebhookServiceName = "varmor-webhook-svc"
 
 	// WebhookServicePort is the port of webhook service
-	WebhookServicePort = 3443
+	WebhookServicePort = getWebhookServicePort()
+
+	// MetricsServicePort is the port of metrics service
+	MetricsServicePort = getMetricsServicePort()
 
 	// CertRenewalInterval is the renewal interval for rootCA
 	CertRenewalInterval time.Duration = 12 * time.Hour
@@ -103,6 +114,18 @@ var (
 	// MutatingWebhookServicePath is the path for mutation webhook
 	MutatingWebhookServicePath = "/mutate"
 
+	// ValidatingWebhookConfigurationName default policy validating webhook configuration name
+	ValidatingWebhookConfigurationName = "varmor-policy-validating-webhook-cfg"
+
+	// ValidatingWebhookConfigurationNameDebug default policy validating webhook configuration name for debug mode
+	ValidatingWebhookConfigurationDebugName = "varmor-policy-validating-webhook-cfg-debug"
+
+	// ValidatingWorkloadWebhookName is the name of policy validating webhook
+	ValidatingPolicyWebhookName = "validatepolicy.varmor.org"
+
+	// ValidatingWebhookServicePath is the path for validation webhook
+	ValidatingWebhookServicePath = "/validate"
+
 	// WebhookTimeout specifies the timeout seconds for the mutation webhook
 	WebhookTimeout = 10
 
@@ -124,8 +147,102 @@ var (
 	// WebhookSelectorLabel is used for matching the admission requests
 	WebhookSelectorLabel = map[string]string{}
 
-	// OmuxSocketPath is used for receiving the audit logs of AppArmor from rsyslog
-	OmuxSocketPath = "/var/run/varmor/audit/omuxsock.sock"
+	// AuditDataDirectory caches the audit data in the agent pod during modeling
+	AuditDataDirectory = "/var/log/varmor/auditdata"
+
+	// ArmorProfileModelDataDirectory saves the ArmorProfileModel objects in the manager pod
+	ArmorProfileModelDataDirectory = "/var/log/varmor/apmdata"
+
+	// AuditEventMetadata caches the cluster metadata that can be injected into the logs
+	AuditEventMetadata = loadAuditEventMetadata()
+
+	// RuntimeEndpoint is the socket address of the containerd
+	RuntimeEndpoint string = "/run/containerd/containerd.sock"
+
+	// DefaultProxyUID is the default UID which the proxy sidecar process runs as
+	DefaultProxyUID int64 = 1337
+
+	// DefaultProxyPort is the default listen port which the proxy sidecar process listens on
+	DefaultProxyPort uint16 = 15001
+
+	// DefaultProxyAdminPort is the default listen port which the proxy sidecar process listens on for admin requests
+	DefaultProxyAdminPort uint16 = 15000
+
+	// DefaultProxyInitImage is the default init image for the proxy sidecar process
+	ProxyInitImage = os.Getenv("PROXY_INIT_IMAGE")
+
+	// DefaultProxyImage is the default image for the proxy sidecar process
+	ProxyImage = os.Getenv("PROXY_IMAGE")
+
+	// MITMCertsMountDir is the in-sidecar directory into which the policy's
+	// unified Secret projects the MITM leaf certificate and private key via
+	// a projected Secret volume. The kubelet performs in-place Secret→file
+	// sync, so updates are picked up by Envoy's watched_directory.
+	MITMCertsMountDir = "/etc/envoy/tls"
+
+	// MITMLeafCertPath is the PEM-encoded MITM leaf certificate file path
+	// consumed by Envoy downstream_tls_context.tls_certificates.
+	MITMLeafCertPath = "/etc/envoy/tls/leaf.crt"
+
+	// MITMLeafKeyPath is the PEM-encoded MITM leaf private key file path
+	// consumed by Envoy downstream_tls_context.tls_certificates.
+	MITMLeafKeyPath = "/etc/envoy/tls/leaf.key"
+
+	// MITMUpstreamTrustedCAPath is the PEM-encoded CA trust bundle file path
+	// consumed by Envoy upstream_tls_context.validation_context for
+	// verifying the real upstream server certificate during MITM
+	// re-encryption. Populated by the policy's unified Secret projection
+	// into the Envoy sidecar (same Secret as the leaf certificate).
+	MITMUpstreamTrustedCAPath = "/etc/envoy/tls/ca-bundle.crt"
+
+	// MITMCABundleMountDir is the in-application-container directory into
+	// which the policy's unified Secret projects the concatenated CA trust
+	// store. A vArmor-proprietary path is used to avoid colliding with the
+	// target image's system CA location (which varies across distros:
+	// Debian/Ubuntu /etc/ssl/certs/ca-certificates.crt, Alpine
+	// /etc/ssl/cert.pem, RHEL /etc/pki/ca-trust/extracted/pem/...).
+	MITMCABundleMountDir = "/etc/varmor/ca-bundle"
+
+	// MITMCABundlePath is the concatenated Mozilla + vArmor-CA trust store
+	// projected into the application container and referenced through the
+	// SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS /
+	// CURL_CA_BUNDLE environment variables injected by the webhook. It is
+	// NOT written to the system CA path so that the target image's own
+	// system CA store remains untouched.
+	MITMCABundlePath = "/etc/varmor/ca-bundle/ca-certificates.crt"
+
+	// AuditNetworkProxySocketDir is the directory that holds the ALS Unix
+	// domain socket. It is shared between the node-local agent (which owns
+	// and listens on the socket) and every injected proxy sidecar on the
+	// node (which connects to it as an Envoy gRPC ALS client). The agent
+	// mounts the parent gate directory (/var/run/varmor/audit) while the sidecar
+	// only mounts this leaf directory, so the socket path resolves to the
+	// same absolute path on both sides. Mounting the directory (not the
+	// socket file) lets the sidecar reconnect after the agent recreates the
+	// socket inode on restart.
+	AuditNetworkProxySocketDir = "/var/run/varmor/audit/als"
+
+	// AuditNetworkProxySocketPath is the ALS Unix domain socket path as seen
+	// inside the sidecar; it equals the Envoy CDS cluster pipe.path and the
+	// agent's listen path.
+	AuditNetworkProxySocketPath = "/var/run/varmor/audit/als/als.sock"
+
+	// AuditNetworkProxyVolumeName is the name of the hostPath volume that
+	// projects AuditNetworkProxySocketDir into the proxy sidecar.
+	AuditNetworkProxyVolumeName = "varmor-network-proxy-audit-als"
+
+	// AuditNetworkProxyALSBufferFlushInterval bounds how long the injected
+	// sidecar's Envoy buffers gRPC access-log entries before flushing them to
+	// the agent's ALS server (e.g. "1s"). It is read by the renderer and
+	// emitted into each access_log common_config. An empty value omits the
+	// field so Envoy applies its own default.
+	AuditNetworkProxyALSBufferFlushInterval = os.Getenv("AUDIT_NETWORK_PROXY_ALS_BUFFER_FLUSH_INTERVAL")
+
+	// AuditNetworkProxyALSBufferSizeBytes bounds the sidecar's in-memory
+	// access-log buffer. Once exceeded Envoy flushes (or drops) rather than
+	// growing without bound, so audit load can never back-pressure egress
+	// forwarding. A zero value omits the field.
+	AuditNetworkProxyALSBufferSizeBytes = getAuditNetworkProxyALSBufferSizeBytes()
 )
 
 // CreateClientConfig creates client config and applies rate limit QPS and burst
@@ -140,8 +257,14 @@ func CreateClientConfig(kubeconfig string, qps float64, burst int, log logr.Logg
 	if qps > math.MaxFloat32 {
 		return nil, fmt.Errorf("client rate limit QPS must not be higher than %e", math.MaxFloat32)
 	}
-	clientConfig.Burst = burst
-	clientConfig.QPS = float32(qps)
+
+	if qps != 0 {
+		clientConfig.QPS = float32(qps)
+	}
+
+	if burst != 0 {
+		clientConfig.Burst = burst
+	}
 
 	return clientConfig, nil
 }
@@ -156,10 +279,119 @@ func createClientConfig(kubeconfig string, log logr.Logger) (*rest.Config, error
 	return clientcmd.BuildConfigFromFlags("", kubeconfig)
 }
 
-func getNamespace() string {
-	content, err := os.ReadFile("/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err != nil {
+func getPodName() string {
+	name := os.Getenv("POD_NAME")
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	return name
+}
+
+func getPodNamespace() string {
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
 		return "varmor"
 	}
-	return strings.Trim(string(content), "\n")
+	return ns
+}
+
+// getVarmorNamespace returns the namespace where the vArmor components are
+// deployed, which is what varmorNamespace in the audit metadata must reflect.
+//
+// It cannot simply reuse getPodNamespace() (POD_NAMESPACE): that env var is
+// context-dependent. In the agent-centralized (runc) path the auditor runs in
+// the varmor-agent DaemonSet, so POD_NAMESPACE is the vArmor namespace and is
+// correct. In the in-sidecar (kata/micro-VM) path the auditor runs inside the
+// business Pod's sidecar, where POD_NAMESPACE is the workload namespace (e.g.
+// "demo") injected via the Downward API - not the vArmor namespace. The
+// manager therefore injects an explicit VARMOR_NAMESPACE env (its own
+// component namespace) into the sidecar; we prefer it here and fall back to
+// POD_NAMESPACE for the agent path where VARMOR_NAMESPACE is unset.
+func getVarmorNamespace() string {
+	if ns := os.Getenv("VARMOR_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return getPodNamespace()
+}
+
+func getAgentReadinessPort() int {
+	readinessPort := os.Getenv("AGENT_READINESS_PORT")
+	if readinessPort != "" {
+		port, err := strconv.Atoi(readinessPort)
+		if err == nil && port > 1024 && port <= 65535 {
+			return port
+		}
+	}
+	return 9580
+}
+
+func getClassifierServicePort() int {
+	port := os.Getenv("CLASSIFIER_SERVICE_PORT")
+	if port != "" {
+		port, err := strconv.Atoi(port)
+		if err == nil && port > 1024 && port <= 65535 {
+			return port
+		}
+	}
+	return 5000
+}
+
+func getStatusServicePort() int {
+	port := os.Getenv("STATUS_SERVICE_PORT")
+	if port != "" {
+		port, err := strconv.Atoi(port)
+		if err == nil && port > 1024 && port <= 65535 {
+			return port
+		}
+	}
+	return 8080
+}
+
+func getWebhookServicePort() int {
+	port := os.Getenv("WEBHOOK_SERVICE_PORT")
+	if port != "" {
+		port, err := strconv.Atoi(port)
+		if err == nil && port > 1024 && port <= 65535 {
+			return port
+		}
+	}
+	return 3443
+}
+
+func getMetricsServicePort() int {
+	port := os.Getenv("METRICS_SERVICE_PORT")
+	if port != "" {
+		port, err := strconv.Atoi(port)
+		if err == nil && port > 1024 && port <= 65535 {
+			return port
+		}
+	}
+	return 8081
+}
+
+func loadAuditEventMetadata() map[string]interface{} {
+	metadata := make(map[string]interface{})
+	s := os.Getenv("AUDIT_EVENT_METADATA")
+	if s != "" {
+		json.Unmarshal([]byte(s), &metadata)
+	}
+	metadata["varmorNamespace"] = getVarmorNamespace()
+	return metadata
+}
+
+// getAuditNetworkProxyALSBufferSizeBytes reads the optional ALS buffer size
+// (AUDIT_NETWORK_PROXY_ALS_BUFFER_SIZE_BYTES) wired from
+// audit.networkProxy.envoyAlsBuffer.bufferSizeBytes. A missing, malformed or
+// non-positive value yields 0, which makes the renderer omit the field and let
+// Envoy apply its own default.
+func getAuditNetworkProxyALSBufferSizeBytes() uint32 {
+	s := os.Getenv("AUDIT_NETWORK_PROXY_ALS_BUFFER_SIZE_BYTES")
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(v)
 }

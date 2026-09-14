@@ -20,174 +20,309 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/kyverno/kyverno/pkg/leaderelection"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zerologr"
+	"github.com/rs/zerolog"
+	"go.uber.org/automaxprocs/maxprocs"
+	"golang.org/x/sys/unix"
 	kubeinformers "k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/klogr"
-	log "sigs.k8s.io/controller-runtime/pkg/log"
+	"k8s.io/klog/v2/textlogger"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	varmoragent "github.com/bytedance/vArmor/internal/agent"
 	"github.com/bytedance/vArmor/internal/config"
+	"github.com/bytedance/vArmor/internal/ipwatcher"
+	"github.com/bytedance/vArmor/internal/leaderelection"
 	"github.com/bytedance/vArmor/internal/policy"
 	"github.com/bytedance/vArmor/internal/policycacher"
 	"github.com/bytedance/vArmor/internal/status"
 	varmortls "github.com/bytedance/vArmor/internal/tls"
+	varmortypes "github.com/bytedance/vArmor/internal/types"
 	varmorutils "github.com/bytedance/vArmor/internal/utils"
 	"github.com/bytedance/vArmor/internal/webhookconfig"
 	"github.com/bytedance/vArmor/internal/webhooks"
 	varmorclient "github.com/bytedance/vArmor/pkg/client/clientset/versioned"
 	varmorinformer "github.com/bytedance/vArmor/pkg/client/informers/externalversions"
+	"github.com/bytedance/vArmor/pkg/metrics"
 	"github.com/bytedance/vArmor/pkg/signal"
 )
 
 const (
-	resyncPeriod       = time.Minute * 15
+	secretResyncPeriod = time.Minute * 15
 	varmorResyncPeriod = time.Hour * 1
+	ipResyncPeriod     = time.Minute * 2
 )
 
 var (
-	kubeconfig               string
-	webhookTimeout           int
-	agent                    bool
-	restartExistWorkloads    bool
-	enableBehaviorModeling   bool
-	enableBpfEnforcer        bool
-	unloadAllAaProfiles      bool
-	removeAllSeccompProfiles bool
-	clientRateLimitQPS       float64
-	clientRateLimitBurst     int
-	managerIP                string
-	webhookMatchLabel        string
-	bpfExclusiveMode         bool
-	statusUpdateCycle        time.Duration
-	setupLog                 = log.Log.WithName("SETUP")
+	agent                      bool
+	preDelete                  bool
+	enableMetrics              bool
+	enableBpfEnforcer          bool
+	enableBehaviorModeling     bool
+	enableServiceEgressControl bool
+	enablePodEgressControl     bool
+	unloadAllAaProfiles        bool
+	removeAllSeccompProfiles   bool
+	bpfExclusiveMode           bool
+	restartExistWorkloads      bool
+	clientRateLimitQPS         float64
+	clientRateLimitBurst       int
+	webhookTimeout             int
+	webhookMatchLabel          string
+	statusUpdateCycle          time.Duration
+	auditLogPaths              string
+	logFormat                  string
+	verbosity                  int
+	managerIP                  string
+	kubeconfig                 string
+	versionFlag                bool
+	debugFlag                  bool
+	gitVersion                 string
+	gitCommit                  string
+	buildDate                  string
+	goVersion                  string
+	logger                     = log.Log
 )
 
-func main() {
-	klog.InitFlags(nil)
-	log.SetLogger(klogr.New())
+func setLogger() {
+	// Disable the log of automaxprocs
+	maxprocs.Set()
 
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	flag.IntVar(&webhookTimeout, "webhookTimeout", int(config.WebhookTimeout), "Timeout for webhook configurations.")
-	flag.BoolVar(&agent, "agent", false, "Set this flag to run vArmor agent. Run vArmor manager default if true.")
-	flag.BoolVar(&restartExistWorkloads, "restartExistWorkloads", false, "Set this flag to allow users control whether or not to restart existing workloads with the .spec.updateExistingWorkloads feild.")
-	flag.BoolVar(&enableBehaviorModeling, "enableBehaviorModeling", false, "Set this flag to enable BehaviorModeling feature (Note: this is an experimental feature, please do not enable it in production environment).")
-	flag.BoolVar(&enableBpfEnforcer, "enableBpfEnforcer", false, "Set this flag to enable BPF enforcer.")
-	flag.BoolVar(&unloadAllAaProfiles, "unloadAllAaProfiles", false, "Unload all AppArmor profiles when the agent exits.")
-	flag.BoolVar(&removeAllSeccompProfiles, "removeAllSeccompProfiles", false, "Remove all Seccomp profiles when the agent exits.")
-	flag.Float64Var(&clientRateLimitQPS, "clientRateLimitQPS", 0, "Configure the maximum QPS to the master from vArmor. Uses the client default if zero.")
-	flag.IntVar(&clientRateLimitBurst, "clientRateLimitBurst", 0, "Configure the maximum burst for throttle. Uses the client default if zero.")
-	flag.StringVar(&managerIP, "managerIP", "0.0.0.0", "Configure the IP address of manager.")
-	flag.StringVar(&webhookMatchLabel, "webhookMatchLabel", "sandbox.varmor.org/enable=true", "Configure the matchLabel of webhook configuration, the valid format is key=value or nil")
-	flag.BoolVar(&bpfExclusiveMode, "bpfExclusiveMode", false, "Set this flag to enable exclusive mode for the BPF enforcer. It will disable the AppArmor confinement when using the BPF enforcer.")
-	flag.DurationVar(&statusUpdateCycle, "statusUpdateCycle", time.Hour*2, "Configure the status update cycle for VarmorPolicy and ArmorProfile")
-
-	if err := flag.Set("v", "2"); err != nil {
-		setupLog.Error(err, "flag.Set()")
-		os.Exit(1)
+	// Setup logger
+	var logrLogger logr.Logger
+	switch logFormat {
+	case "json":
+		zerologger := zerolog.New(os.Stdout).With().Timestamp().Caller().Logger()
+		zerologr.SetMaxV(verbosity)
+		logrLogger = zerologr.New(&zerologger)
+	default:
+		c := textlogger.NewConfig(textlogger.Verbosity(verbosity))
+		logrLogger = textlogger.NewLogger(c)
 	}
-	flag.Parse()
+	log.SetLogger(logrLogger)
+	klog.SetLogger(logrLogger)
 
-	// Set the webhook matchLabels configuration.
+	if id, ok := config.AuditEventMetadata["accountID"]; ok {
+		logger = logger.WithValues("accountID", id)
+	}
+	if region, ok := config.AuditEventMetadata["region"]; ok {
+		logger = logger.WithValues("region", region)
+	}
+	if id, ok := config.AuditEventMetadata["clusterID"]; ok {
+		logger = logger.WithValues("clusterID", id)
+	}
+	if name, ok := config.AuditEventMetadata["clusterName"]; ok {
+		logger = logger.WithValues("clusterName", name)
+	}
+	logger = logger.WithValues("podName", config.Name)
+	logger = logger.WithValues("podNamespace", config.Namespace)
+}
+
+func setWebhookMatchLabel(webhookMatchLabel string, logger logr.Logger) {
 	if webhookMatchLabel != "" {
 		labelKvs := strings.Split(webhookMatchLabel, "=")
 		if len(labelKvs) != 2 {
-			setupLog.Error(fmt.Errorf("format error"), "failed to parse the --webhookMatchLabel argument, the valid format is key=value or nil")
+			logger.WithName("SETUP").Error(fmt.Errorf("format error"), "failed to parse the --webhookMatchLabel argument, the valid format is key=value or nil")
 			os.Exit(1)
 		}
 		config.WebhookSelectorLabel[labelKvs[0]] = labelKvs[1]
 	}
+}
 
-	debug := kubeconfig != ""
+func updateAPIServerVersion(kubeClient *kubernetes.Clientset) {
+	serverVersion, err := kubeClient.ServerVersion()
+	if err != nil {
+		logger.WithName("SETUP").Error(err, "Failed to get APIServer version")
+		return
+	}
+
+	// Only update if version string has changed
+	if config.ServerVersion == nil || serverVersion.String() != config.ServerVersion.String() {
+		appArmorGA, err := varmorutils.IsAppArmorGA(serverVersion)
+		if err != nil {
+			logger.WithName("SETUP").Error(err, "Failed to check AppArmor GA status")
+			return
+		}
+
+		config.ServerVersion = serverVersion
+		config.AppArmorGA = appArmorGA
+		logger.WithName("SETUP").Info("APIServer version updated", "version", serverVersion.String(), "AppArmorGA", appArmorGA)
+	}
+}
+
+func main() {
+	flag.BoolVar(&agent, "agent", false, "Set this flag to run vArmor agent.")
+	flag.BoolVar(&preDelete, "preDelete", false, "Set this flag to run pre-delete hook before uninstalling vArmor.")
+	flag.BoolVar(&enableMetrics, "enableMetrics", false, "Set this flag to enable metrics.")
+	flag.BoolVar(&enableBpfEnforcer, "enableBpfEnforcer", false, "Set this flag to enable BPF enforcer.")
+	flag.BoolVar(&enableBehaviorModeling, "enableBehaviorModeling", false, "Set this flag to enable BehaviorModeling feature (Note: this is an experimental feature, please do not enable it in production environment).")
+	flag.BoolVar(&enableServiceEgressControl, "enableServiceEgressControl", false, "Set this flag to enable the egress control feature for Service access")
+	flag.BoolVar(&enablePodEgressControl, "enablePodEgressControl", false, "Set this flag to enable the egress control feature for Pod access")
+	flag.BoolVar(&unloadAllAaProfiles, "unloadAllAaProfiles", false, "Unload all AppArmor profiles when the agent exits.")
+	flag.BoolVar(&removeAllSeccompProfiles, "removeAllSeccompProfiles", false, "Remove all Seccomp profiles when the agent exits.")
+	flag.BoolVar(&bpfExclusiveMode, "bpfExclusiveMode", false, "Set this flag to enable exclusive mode for the BPF enforcer. It will disable the AppArmor confinement when using the BPF enforcer.")
+	flag.BoolVar(&restartExistWorkloads, "restartExistWorkloads", false, "Set this flag to allow users control whether or not to restart existing workloads with the .spec.updateExistingWorkloads feild.")
+	flag.Float64Var(&clientRateLimitQPS, "clientRateLimitQPS", 150, "Configure the maximum QPS to the master from vArmor. Uses the client default if zero.")
+	flag.IntVar(&clientRateLimitBurst, "clientRateLimitBurst", 300, "Configure the maximum burst for throttle. Uses the client default if zero.")
+	flag.IntVar(&webhookTimeout, "webhookTimeout", int(config.WebhookTimeout), "Timeout for webhook configurations.")
+	flag.StringVar(&webhookMatchLabel, "webhookMatchLabel", "sandbox.varmor.org/enable=true", "Configure the matchLabel of webhook configuration, the valid format is key=value or nil")
+	flag.DurationVar(&statusUpdateCycle, "statusUpdateCycle", time.Hour*2, "Configure the status update cycle for VarmorPolicy and ArmorProfile")
+	flag.StringVar(&auditLogPaths, "auditLogPaths", "/var/log/audit/audit.log|/var/log/kern.log", "Configure the file search list to select the audit log file and read the AppArmor and Seccomp audit events. Please use a vertical bar to separate the file paths, the first valid file will be used to track the audit events.")
+	flag.StringVar(&logFormat, "logFormat", "text", "Log format (text or json). Default is text.")
+	flag.IntVar(&verbosity, "v", 0, "Log verbosity level (higher value means more verbose).")
+	flag.IntVar(&verbosity, "verbosity", 0, "Log verbosity level (higher value means more verbose).")
+	flag.StringVar(&managerIP, "managerIP", "0.0.0.0", "Configure the IP address of manager.")
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.BoolVar(&versionFlag, "version", false, "Print the version information.")
+	flag.BoolVar(&debugFlag, "debug", false, "Enable debug mode.")
+	flag.Parse()
+
+	if versionFlag {
+		fmt.Printf("GitVersion: %s\nGitCommit: %s\nBuildDate: %s\nGoVersion: %s\n", gitVersion, gitCommit, buildDate, goVersion)
+		return
+	}
+
+	// Setup logger
+	setLogger()
+
+	// Set the webhook matchLabels configuration.
+	setWebhookMatchLabel(webhookMatchLabel, logger)
+
+	// Set gin mode
+	if debugFlag {
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	// Check if running in-cluster
+	inContainer := kubeconfig == ""
+
+	// Set up signal handler
 	stopCh := signal.SetupSignalHandler()
 
-	clientConfig, err := config.CreateClientConfig(kubeconfig, clientRateLimitQPS, clientRateLimitBurst, log.Log)
+	// Create a k8s client
+	clientConfig, err := config.CreateClientConfig(kubeconfig, clientRateLimitQPS, clientRateLimitBurst, logger)
 	if err != nil {
-		setupLog.Error(err, "config.CreateClientConfig()")
+		logger.WithName("SETUP").Error(err, "config.CreateClientConfig()")
 		os.Exit(1)
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(clientConfig)
 	if err != nil {
-		setupLog.Error(err, "kubernetes.NewForConfig()")
+		logger.WithName("SETUP").Error(err, "kubernetes.NewForConfig()")
 		os.Exit(1)
 	}
 
 	// vArmor CRD CLIENT, access CRD resources: ArmorProfile & VarmorPolicy
 	varmorClient, err := varmorclient.NewForConfig(clientConfig)
 	if err != nil {
-		setupLog.Error(err, "varmorclient.NewForConfig()")
+		logger.WithName("SETUP").Error(err, "varmorclient.NewForConfig()")
 		os.Exit(1)
 	}
 
 	// vArmor CRD INFORMER, used to watch CRD resources: ArmorProfile & VarmorPolicy
-	varmorInformer := varmorinformer.NewSharedInformerFactoryWithOptions(varmorClient, varmorResyncPeriod)
+	varmorFactory := varmorinformer.NewSharedInformerFactoryWithOptions(varmorClient, varmorResyncPeriod)
 
-	// Gather APIServer version
-	config.ServerVersion, err = kubeClient.ServerVersion()
-	if err != nil {
-		setupLog.Error(err, "kubeClient.ServerVersion()")
-		os.Exit(1)
+	// Gather APIServer version initially and periodically every 10 minutes
+	// The cluster may experience changes in the APIServer version due to upgrades,
+	// so regular collection is required.
+	updateAPIServerVersion(kubeClient)
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				updateAPIServerVersion(kubeClient)
+			}
+		}
+	}()
+
+	// Pre-delete hook cleanup all policies before uninstalling vArmor
+	if preDelete {
+		err = preDeleteHook(kubeClient, varmorClient, logger)
+		if err != nil {
+			os.Exit(1)
+		}
+		return
 	}
 
-	config.AppArmorGA, err = varmorutils.IsAppArmorGA(config.ServerVersion)
-	if err != nil {
-		setupLog.Error(err, "varmorutils.IsAppArmorGA()")
-		os.Exit(1)
-	}
-
-	if debug {
-		gin.SetMode(gin.DebugMode)
-	} else {
-		gin.SetMode(gin.ReleaseMode)
-	}
+	// init a metrics
+	metricsModule := metrics.NewMetricsModule(logger.WithName("METRICS"), enableMetrics, 10, config.MetricsServicePort)
 
 	if agent {
-		setupLog.Info("vArmor agent startup")
+		logger.WithName("SETUP").Info("vArmor agent startup")
 
-		agentCtrl, err := varmoragent.NewAgent(
-			kubeClient.CoreV1().Pods(config.Namespace),
+		// RemoveMemlock requires the write permission for /proc/sys/kernel/printk_ratelimit
+		if inContainer {
+			err = unix.Unmount("/proc/sys", 0)
+			if err != nil {
+				logger.WithName("SETUP").Error(err, "unix.Unmount(\"/proc/sys\", 0)")
+				os.Exit(1)
+			}
+		}
+
+		svcAddresses := make(map[string]string, 2)
+		if inContainer {
+			svcAddresses[config.StatusServiceName] = fmt.Sprintf("%s.%s:%d", config.StatusServiceName, config.Namespace, config.StatusServicePort)
+			svcAddresses[config.ClassifierServiceName] = fmt.Sprintf("%s.%s:%d", config.ClassifierServiceName, config.Namespace, config.ClassifierServicePort)
+		} else {
+			svcAddresses[config.StatusServiceName] = fmt.Sprintf("%s:%d", managerIP, config.StatusServicePort)
+			svcAddresses[config.ClassifierServiceName] = fmt.Sprintf("%s:%d", managerIP, config.ClassifierServicePort)
+		}
+
+		agent, err := varmoragent.NewAgent(
 			varmorClient.CrdV1beta1(),
-			varmorInformer.Crd().V1beta1().ArmorProfiles(),
+			varmorFactory.Crd().V1beta1().ArmorProfiles(),
 			enableBehaviorModeling,
 			enableBpfEnforcer,
 			unloadAllAaProfiles,
 			removeAllSeccompProfiles,
-			debug,
-			managerIP,
-			config.StatusServicePort,
-			config.ClassifierServicePort,
+			svcAddresses,
+			debugFlag,
+			inContainer,
+			auditLogPaths,
 			stopCh,
-			log.Log.WithName("AGENT"),
+			metricsModule,
+			logger.WithName("AGENT"),
 		)
 		if err != nil {
-			setupLog.Error(err, "agent.NewAgent()")
+			logger.WithName("SETUP").Error(err, "agent.NewAgent()")
 			os.Exit(1)
 		}
-
-		go agentCtrl.Run(1, stopCh)
+		varmorFactory.Start(stopCh)
+		go agent.Run(1, stopCh)
 
 		// Wait for the manager to be ready.
-		setupLog.Info("Waiting for the manager to be ready")
-		varmorutils.WaitForManagerReady(debug, managerIP, config.StatusServicePort)
+		logger.WithName("SETUP").Info("Waiting for the manager to be ready")
+		agent.WaitForManagerReady()
 
-		// Starting up agent.
-		varmorInformer.Start(stopCh)
-		varmorutils.SetAgentReady()
-		setupLog.Info("vArmor agent is online")
+		// Set the agent to ready.
+		agent.SetAgentReady()
+
+		logger.WithName("SETUP").Info("vArmor agent is online")
 
 		<-stopCh
 
-		agentCtrl.CleanUp()
-		setupLog.Info("vArmor agent shutdown successful")
+		agent.CleanUp()
+		logger.WithName("SETUP").Info("vArmor agent shutdown successful")
 
 	} else {
-		setupLog.Info("vArmor manager startup")
+		logger.WithName("SETUP").Info("vArmor manager startup")
 
 		// leader election context
 		leaderCtx, cancel := context.WithCancel(context.Background())
@@ -197,11 +332,11 @@ func main() {
 			cancel()
 		}()
 
+		// Create a policy cacher for the webhook server and proxy config propagator
 		cacher, _ := policycacher.NewPolicyCacher(
-			varmorInformer.Crd().V1beta1().VarmorClusterPolicies(),
-			varmorInformer.Crd().V1beta1().VarmorPolicies(),
-			debug,
-			log.Log.WithName("POLICY-CACHER"))
+			varmorFactory.Crd().V1beta1().VarmorClusterPolicies(),
+			varmorFactory.Crd().V1beta1().VarmorPolicies(),
+			logger.WithName("POLICY-CACHER"))
 		go cacher.Run(stopCh)
 
 		certRenewer := varmortls.NewCertRenewer(
@@ -211,151 +346,252 @@ func main() {
 			config.CertRenewalInterval,
 			config.CertValidityDuration,
 			managerIP,
-			debug,
-			log.Log.WithName("CERT-RENEWER"),
+			inContainer,
+			logger.WithName("CERT-RENEWER"),
 		)
-		secretInformer := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod, kubeinformers.WithNamespace(config.Namespace))
+
+		secretFactory := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, secretResyncPeriod, kubeinformers.WithNamespace(config.Namespace))
 		certManager := webhookconfig.NewCertManager(
 			clientConfig,
 			certRenewer,
 			kubeClient.CoreV1().Secrets(config.Namespace),
-			secretInformer.Core().V1().Secrets(),
+			secretFactory.Core().V1().Secrets(),
 			stopCh,
-			log.Log.WithName("CERT-MANAGER"),
+			logger.WithName("CERT-MANAGER"),
 		)
+		secretFactory.Start(stopCh)
 
-		kubeInformer := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod)
+		// Dynamic configuration: watch the varmor-config ConfigMap in the vArmor
+		// namespace so runtime settings (e.g. micro-VM detection rules) hot-reload
+		// without a manager restart. A dedicated namespace-scoped factory keeps the
+		// RBAC surface minimal (configmaps get/list/watch in this namespace only).
+		configFactory := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, secretResyncPeriod, kubeinformers.WithNamespace(config.Namespace))
+		configMapInformer := configFactory.Core().V1().ConfigMaps()
+		config.StartDynamicConfigInformer(configMapInformer, logger.WithName("DYNAMIC-CONFIG"))
+		configFactory.Start(stopCh)
+		if !cache.WaitForCacheSync(stopCh, configMapInformer.Informer().HasSynced) {
+			logger.WithName("SETUP").Error(fmt.Errorf("failed to sync dynamic config informer cache"), "cache.WaitForCacheSync()")
+			os.Exit(1)
+		}
+
+		wcFactory := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, secretResyncPeriod)
 		webhookRegister := webhookconfig.NewRegister(
 			clientConfig,
 			kubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations(),
+			kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 			kubeClient.CoreV1().Secrets(config.Namespace),
 			kubeClient.AppsV1().Deployments(config.Namespace),
 			kubeClient.CoordinationV1().Leases(config.Namespace),
 			varmorClient.CrdV1beta1(),
-			varmorInformer.Crd().V1beta1().VarmorPolicies(),
-			kubeInformer.Admissionregistration().V1().MutatingWebhookConfigurations(),
+			wcFactory.Admissionregistration().V1().MutatingWebhookConfigurations(),
+			wcFactory.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 			managerIP,
 			int32(webhookTimeout),
-			debug,
+			inContainer,
 			stopCh,
-			log.Log.WithName("WEBHOOK-CONFIG"),
+			logger.WithName("WEBHOOK-CONFIG"),
 		)
+		wcFactory.Start(stopCh)
 
 		// Elect a leader to register the admission webhook configurations.
-		registerWebhookConfigurations := func() {
-			// Only leader init the secrets of CA cert and TLS pair.
+		registerWebhookConfigurations := func(ctx context.Context) {
+			// Only leader initializes the secrets of CA cert and TLS pair.
 			certManager.InitTLSPemPair()
-			// Only leader register MutatingWebhookConfiguration.
+			// Only leader registers the MutatingWebhookConfiguration object.
 			err = webhookRegister.Register()
 			if err != nil {
-				setupLog.Error(err, "webhookRegister.Register()")
+				logger.WithName("SETUP").Error(err, "webhookRegister.Register()")
 				os.Exit(1)
 			}
 		}
-		webhookRegisterLeader, err := leaderelection.New("webhook-register", config.Namespace, kubeClient, registerWebhookConfigurations, nil, log.Log.WithName("webhook-register/LeaderElection"))
+		webhookRegisterLeader, err := leaderelection.New(
+			kubeClient,
+			"webhook-register",
+			config.Namespace,
+			config.Name,
+			registerWebhookConfigurations,
+			nil,
+			logger.WithName("WEBHOOK-REGISTER/LEADER-ELECTION"),
+		)
 		if err != nil {
-			setupLog.Error(err, "failed to elect a leader")
+			logger.WithName("SETUP").Error(err, "failed to elect a leader")
 			os.Exit(1)
 		}
 		go webhookRegisterLeader.Run(leaderCtx)
 
-		// The webhook server runs across all instances.
+		// Create a TLS key/certificate pair for the webhook server and status server
 		tlsPair, err := certManager.GetTLSPemPair()
 		if err != nil {
-			setupLog.Error(err, "Failed to get TLS key/certificate pair")
+			logger.WithName("SETUP").Error(err, "Failed to get TLS key/certificate pair")
 			os.Exit(1)
 		}
+
+		// Create the webhook server.
+		// It runs across all instances.
 		webhookServer, err := webhooks.NewWebhookServer(
 			webhookRegister,
 			cacher,
 			tlsPair,
 			managerIP,
 			config.WebhookServicePort,
+			enableBehaviorModeling,
 			bpfExclusiveMode,
-			log.Log.WithName("WEBHOOK-SERVER"))
+			metricsModule,
+			logger.WithName("WEBHOOK-SERVER"))
 		if err != nil {
-			setupLog.Error(err, "Failed to create webhook webhookServer")
+			logger.WithName("SETUP").Error(err, "Failed to create webhook webhookServer")
 			os.Exit(1)
 		}
 		go webhookServer.Run()
 
-		// The service is used for state synchronization. It only works with leader.
+		// Create a service for state synchronization.
+		// It's only run by the leader.
 		statusSvc, err := status.NewStatusService(
 			managerIP,
 			config.StatusServicePort,
 			tlsPair,
-			debug,
+			debugFlag,
+			inContainer,
 			kubeClient.CoreV1(),
 			kubeClient.AppsV1(),
 			varmorClient.CrdV1beta1(),
 			kubeClient.AuthenticationV1(),
+			kubeClient.AuthorizationV1(),
 			statusUpdateCycle,
-			log.Log.WithName("STATUS-SERVICE"),
+			metricsModule,
+			logger.WithName("STATUS-SERVICE"),
 		)
 		if err != nil {
-			setupLog.Error(err, "service.NewStatusService()")
+			logger.WithName("SETUP").Error(err, "service.NewStatusService()")
 			os.Exit(1)
 		}
 
+		// Create an IPWatcher to watch the Pod and Service IP changes.
+		// It uses the IP that matches the egress rules of policies to update the armorprofile.
+		// It's only run by the leader.
+		//
+		// Please note that only the BPF enforcer supports restricting container access to specific
+		// Pods and Services currently. After the AppArmor enforcer is adapted to AppArmor 4.0, it
+		// will also support this feature.
+		egressCache := make(map[string]varmortypes.EgressInfo)
+		egressCacheMutex := &sync.RWMutex{}
+		var ipWatcher *ipwatcher.IPWatcher
+		if (enableServiceEgressControl || enablePodEgressControl) && enableBpfEnforcer {
+			factory := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, ipResyncPeriod, kubeinformers.WithTransform(ipwatcher.Transform))
+			var serviceInformer coreinformers.ServiceInformer
+			var endpointSliceInformer discoveryinformers.EndpointSliceInformer
+			var podInformer coreinformers.PodInformer
+
+			if enableServiceEgressControl {
+				serviceInformer = factory.Core().V1().Services()
+				endpointSliceInformer = factory.Discovery().V1().EndpointSlices()
+			}
+			if enablePodEgressControl {
+				podInformer = factory.Core().V1().Pods()
+			}
+
+			ipWatcher, err = ipwatcher.NewIPWatcher(
+				varmorClient.CrdV1beta1(),
+				podInformer,
+				serviceInformer,
+				endpointSliceInformer,
+				egressCache,
+				egressCacheMutex,
+				logger.WithName("IP-WATCHER"))
+			if err != nil {
+				logger.WithName("SETUP").Error(err, "ipwatcher.NewIPWatcher()")
+				os.Exit(1)
+			}
+			factory.Start(stopCh)
+		}
+
+		// Create the VarmorClusterPolicy controller.
+		// It's only run by the leader.
 		clusterPolicyCtrl, err := policy.NewClusterPolicyController(
-			kubeClient.CoreV1().Pods(config.Namespace),
-			kubeClient.AppsV1(),
+			kubeClient,
 			varmorClient.CrdV1beta1(),
-			varmorInformer.Crd().V1beta1().VarmorClusterPolicies(),
+			varmorFactory.Crd().V1beta1().VarmorClusterPolicies(),
 			statusSvc.StatusManager,
+			egressCache,
+			egressCacheMutex,
 			restartExistWorkloads,
 			enableBehaviorModeling,
+			enableServiceEgressControl,
+			enablePodEgressControl,
 			bpfExclusiveMode,
-			debug,
-			log.Log.WithName("CLUSTER-POLICY"),
+			logger.WithName("CLUSTER-POLICY"),
 		)
 		if err != nil {
-			setupLog.Error(err, "policy.NewClusterPolicyController()")
+			logger.WithName("SETUP").Error(err, "policy.NewClusterPolicyController()")
 			os.Exit(1)
 		}
 
+		// Create the VarmorPolicy controller.
+		// It's only run by the leader.
 		policyCtrl, err := policy.NewPolicyController(
-			kubeClient.CoreV1().Pods(config.Namespace),
-			kubeClient.AppsV1(),
+			kubeClient,
 			varmorClient.CrdV1beta1(),
-			varmorInformer.Crd().V1beta1().VarmorPolicies(),
+			varmorFactory.Crd().V1beta1().VarmorPolicies(),
 			statusSvc.StatusManager,
+			egressCache,
+			egressCacheMutex,
 			restartExistWorkloads,
 			enableBehaviorModeling,
+			enableServiceEgressControl,
+			enablePodEgressControl,
 			bpfExclusiveMode,
-			debug,
-			log.Log.WithName("POLICY"),
+			logger.WithName("POLICY"),
 		)
 		if err != nil {
-			setupLog.Error(err, "policy.NewPolicyController()")
+			logger.WithName("SETUP").Error(err, "policy.NewPolicyController()")
 			os.Exit(1)
 		}
 
-		retriable := func(err error) bool {
-			return err != nil
-		}
+		// Start all varmor CRD informers
+		varmorFactory.Start(stopCh)
+
+		// Create the ProxyConfigPropagator to watch the Namespace creation and propagate the proxy config
+		// for the VarmorClusterPolicy with the NetworkProxy enforcer.
+		nsFactory := kubeinformers.NewSharedInformerFactoryWithOptions(kubeClient, varmorResyncPeriod)
+		proxyPropagator := policy.NewProxyConfigPropagator(
+			kubeClient,
+			varmorClient.CrdV1beta1(),
+			nsFactory.Core().V1().Namespaces(),
+			cacher,
+			stopCh,
+			logger.WithName("PROXY-CONFIG-PROPAGATOR"))
+		nsFactory.Start(stopCh)
 
 		// Wrap all controllers that need leaderelection, start them once by the leader.
-		leaderRun := func() {
-			// Only the leader manage the status service.
+		leaderRun := func(ctx context.Context) {
+			if (enableServiceEgressControl || enablePodEgressControl) && enableBpfEnforcer {
+				// Only the leader watches the Pod and Service IP changes.
+				go ipWatcher.Run(1, stopCh)
+			}
+			// Only the leader manages the status service.
 			go statusSvc.Run(stopCh)
-			// Only the leader validates the CA Cert periodically and rolling update manager when secrets changed or rootCA expired.
+			// Only the leader validates the CA Cert periodically and updates manager when the rootCA is changed or expired.
 			go certManager.Run(stopCh)
-			// Only the leader run as the VarmorClusterPolicy & VarmorPolicy controller.
+			// Only the leader runs as the VarmorClusterPolicy & VarmorPolicy controller.
 			go clusterPolicyCtrl.Run(1, stopCh)
 			go policyCtrl.Run(1, stopCh)
+			go proxyPropagator.Run(stopCh)
+
 			// Tag the leader Pod with "identity: leader" label so that agents can use varmor-status-svc for state synchronization.
-			if !debug {
+			if inContainer {
+				retriable := func(err error) bool {
+					return err != nil
+				}
 				tag := func() error {
 					err := varmorutils.UnTagLeaderPod(kubeClient.CoreV1().Pods(config.Namespace))
 					if err != nil {
 						return err
 					}
-					return varmorutils.TagLeaderPod(kubeClient.CoreV1().Pods(config.Namespace))
+					return varmorutils.TagLeaderPod(kubeClient.CoreV1().Pods(config.Namespace), config.Name)
 				}
 				err := retry.OnError(retry.DefaultRetry, retriable, tag)
 				if err != nil {
-					setupLog.Error(err, "Retag Leader failed")
+					logger.WithName("SETUP").Error(err, "Retag Leader failed")
 					os.Exit(1)
 				}
 			}
@@ -367,26 +603,32 @@ func main() {
 			policyCtrl.CleanUp()
 			signal.RequestShutdown()
 		}
-		leader, err := leaderelection.New("varmor-manager", config.Namespace, kubeClient, leaderRun, leaderStop, log.Log.WithName("varmor-manager/LeaderElection"))
+
+		leader, err := leaderelection.New(
+			kubeClient,
+			"varmor-manager",
+			config.Namespace,
+			config.Name,
+			leaderRun,
+			leaderStop,
+			logger.WithName("VARMOR-MANAGER/LEADER-ELECTION"),
+		)
 		if err != nil {
-			setupLog.Error(err, "failed to elect a leader")
+			logger.WithName("SETUP").Error(err, "failed to elect a leader")
 			os.Exit(1)
 		}
 		go leader.Run(leaderCtx)
 
-		varmorInformer.Start(stopCh)
-		kubeInformer.Start(stopCh)
-		secretInformer.Start(stopCh)
-
-		setupLog.Info("vArmor manager is online")
+		logger.WithName("SETUP").Info("vArmor manager is online")
 
 		<-stopCh
 
+		// Cleanup the webhook resource when the manager exits.
 		if webhookRegister.ShouldRemoveVarmorResources() {
 			webhookRegister.Remove()
 		}
 		webhookServer.CleanUp()
 
-		setupLog.Info("vArmor manager shutdown successful")
+		logger.WithName("SETUP").Info("vArmor manager shutdown successful")
 	}
 }

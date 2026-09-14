@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package webhookconfig implements the webhook register and cert manager for the admission webhook.
 package webhookconfig
 
 import (
@@ -120,7 +121,7 @@ func (m *certManager) addSecretFunc(obj interface{}) {
 	if !ok || val != "true" {
 		return
 	}
-	logger.V(3).Info("varmor secret added, reconciling webhook configurations")
+	logger.V(2).Info("varmor secret added, reconciling webhook configurations")
 	m.secretQueue <- true
 }
 
@@ -142,10 +143,19 @@ func (m *certManager) updateSecretFunc(oldObj interface{}, newObj interface{}) {
 		return
 	}
 
-	logger.V(3).Info("varmor secret updated, reconciling webhook configurations")
+	logger.V(2).Info("varmor secret updated, reconciling webhook configurations")
 	m.secretQueue <- true
 }
 
+// Run starts the certificate manager's main event loop.
+// This function runs continuously and handles three types of events:
+// 1. Periodic certificate renewal checks based on config.CertRenewalInterval
+// 2. Secret change events (add/update) that trigger certificate validation
+// 3. Stop signal to gracefully shutdown the manager
+//
+// The manager operates in two modes:
+// - Timer-driven: Regularly checks certificate validity and triggers rolling updates when needed
+// - Event-driven: Responds to secret changes and validates certificates accordingly
 func (m *certManager) Run(stopCh <-chan struct{}) {
 	logger := m.log
 	logger.Info("starting")
@@ -162,11 +172,15 @@ func (m *certManager) Run(stopCh <-chan struct{}) {
 		UpdateFunc: m.updateSecretFunc,
 	})
 
+	// Create a ticker for periodic certificate renewal checks
+	// Uses the interval defined in config.CertRenewalInterval
 	certsRenewalTicker := time.NewTicker(config.CertRenewalInterval)
 	defer certsRenewalTicker.Stop()
 
+	// Main event loop - processes three types of events
 	for {
 		select {
+		// Case 1: Timer-driven certificate renewal check
 		case <-certsRenewalTicker.C:
 			certProps, err := varmortls.GetTLSCertProps(m.clientConfig)
 			if err != nil {
@@ -192,6 +206,7 @@ func (m *certManager) Run(stopCh <-chan struct{}) {
 				os.Exit(1)
 			}
 
+		// Case 2: Event-driven certificate validation (secret changes)
 		case <-m.secretQueue:
 			certProps, err := varmortls.GetTLSCertProps(m.clientConfig)
 			if err != nil {
@@ -217,6 +232,7 @@ func (m *certManager) Run(stopCh <-chan struct{}) {
 				os.Exit(1)
 			}
 
+		// Case 3: Stop signal received - gracefully shutdown
 		case <-m.stopCh:
 			logger.Info("stopping cert renewer")
 			return

@@ -12,48 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package types defines the types used in vArmor.
 package types
 
 import (
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
 )
 
+// Enforcer represents policy enforcement mechanisms.
 type Enforcer int
 
 const (
-	// VarmorPolicy Enforcer
-	AppArmor Enforcer = 0x00000001
-	BPF      Enforcer = 0x00000002
-	Seccomp  Enforcer = 0x00000004
-	Unknown  Enforcer = 0x00000008
-
-	// VarmorPolicy Mode
-	AlwaysAllowMode      varmor.VarmorPolicyMode = "AlwaysAllow"
-	RuntimeDefaultMode   varmor.VarmorPolicyMode = "RuntimeDefault"
-	EnhanceProtectMode   varmor.VarmorPolicyMode = "EnhanceProtect"
-	BehaviorModelingMode varmor.VarmorPolicyMode = "BehaviorModeling"
-	DefenseInDepthMode   varmor.VarmorPolicyMode = "DefenseInDepth"
-
-	// VarmorPolicy Phase
-	VarmorPolicyPending    varmor.VarmorPolicyPhase = "Pending"
-	VarmorPolicyModeling   varmor.VarmorPolicyPhase = "Modeling"
-	VarmorPolicyCompleted  varmor.VarmorPolicyPhase = "Completed"
-	VarmorPolicyProtecting varmor.VarmorPolicyPhase = "Protecting"
-	VarmorPolicyError      varmor.VarmorPolicyPhase = "Error"
-	VarmorPolicyFailed     varmor.VarmorPolicyPhase = "Failed"
-	VarmorPolicyUnknown    varmor.VarmorPolicyPhase = "Unknown"
-	VarmorPolicyUnchanged  varmor.VarmorPolicyPhase = "Unchanged"
-
-	// VarmorPolicy Condition Type
-	VarmorPolicyCreated varmor.VarmorPolicyConditionType = "Created"
-	VarmorPolicyUpdated varmor.VarmorPolicyConditionType = "Updated"
-	VarmorPolicyReady   varmor.VarmorPolicyConditionType = "Ready"
-
-	// ArmorProfile Condition Type
-	ArmorProfileReady      varmor.ArmorProfileConditionType      = "Ready"
-	ArmorProfileModelReady varmor.ArmorProfileModelConditionType = "Ready"
+	// Enforcer types
+	AppArmor     Enforcer = 0x00000001
+	BPF          Enforcer = 0x00000002
+	Seccomp      Enforcer = 0x00000004
+	NetworkProxy Enforcer = 0x00000008
+	Unknown      Enforcer = 0x00000010
 
 	// AppArmor Profile process Status
 	Succeeded Status = "succeeded"
@@ -65,6 +44,9 @@ const (
 	// Event type for the bpf tracer
 	SchedProcessFork uint32 = 1
 	SchedProcessExec uint32 = 2
+
+	// ReconcileAnnotation control whether to force agents to update the profile
+	ReconcileAnnotation string = "profile-reconcile-counter"
 )
 
 type Status string
@@ -80,8 +62,8 @@ type ProfileStatus struct {
 
 // PolicyStatus used to cache the status of ArmorProfile and VarmorProfile objects.
 type PolicyStatus struct {
-	SuccessedNumber int
-	FailedNumber    int
+	SuccessedNumber int32
+	FailedNumber    int32
 	NodeMessages    map[string]string // Use NodeName as its key
 }
 
@@ -97,85 +79,53 @@ type BehaviorData struct {
 
 // ModelingStatus used to cache the status of ArmorProfileModel objects.
 type ModelingStatus struct {
-	CompletedNumber int
-	FailedNumber    int
+	CompletedNumber int32
+	FailedNumber    int32
 	NodeMessages    map[string]string // Use NodeName as its key
 }
 
-type AaLogRecord struct {
-	Resource      string
-	ActiveHat     string
-	AaMode        string
-	Time          int64
-	Operation     string
-	Profile       string
-	Name          string
-	Name2         string
-	Attr          string
-	Parent        uint64
-	Pid           uint64
-	Task          uint64
-	Info          string
-	ErrorCode     int32
-	DeniedMask    string
-	RequestedMask string
-	MagicToken    uint64
-	Family        string
-	Protocol      string
-	SockType      string
-	Fsuid         uint64
-	Ouid          uint64
-	Signal        string
-	Peer          string
-	PeerProfile   string
-	Bus           string
-	Path          string
-	Interface     string
-	Member        string
-}
-
-type SeccompLogRecord struct {
-	Time    int64
-	Pid     uint64
-	Exe     string
-	Comm    string
-	Syscall string
-}
-
-type BpfTraceEvent struct {
-	Type       uint32
-	ParentPid  uint32
-	ParentTgid uint32
-	ChildPid   uint32
-	ChildTgid  uint32
-	MntNsId    uint32
-	ParentTask [16]uint8
-	ChildTask  [16]uint8
-	Filename   [64]uint8
-}
-
-var enforcerMap = map[string]Enforcer{
-	"apparmor":           AppArmor,
-	"bpf":                BPF,
-	"seccomp":            Seccomp,
-	"apparmorbpf":        AppArmor | BPF,
-	"bpfapparmor":        AppArmor | BPF,
-	"apparmorseccomp":    AppArmor | Seccomp,
-	"seccompapparmor":    AppArmor | Seccomp,
-	"bpfseccomp":         BPF | Seccomp,
-	"seccompbpf":         BPF | Seccomp,
-	"apparmorbpfseccomp": AppArmor | BPF | Seccomp,
-	"apparmorseccompbpf": AppArmor | BPF | Seccomp,
-	"bpfapparmorseccomp": AppArmor | BPF | Seccomp,
-	"bpfseccompapparmor": AppArmor | BPF | Seccomp,
-	"seccompbpfapparmor": AppArmor | BPF | Seccomp,
-	"seccompapparmorbpf": AppArmor | BPF | Seccomp,
-}
-
 func GetEnforcerType(enforcer string) Enforcer {
+	t := Enforcer(0)
+
 	enforcer = strings.ToLower(enforcer)
-	if t, ok := enforcerMap[enforcer]; ok {
+	if strings.Contains(enforcer, "apparmor") {
+		t |= AppArmor
+	}
+	if strings.Contains(enforcer, "bpf") {
+		t |= BPF
+	}
+	if strings.Contains(enforcer, "seccomp") {
+		t |= Seccomp
+	}
+	if strings.Contains(enforcer, "networkproxy") {
+		t |= NetworkProxy
+	}
+
+	if t == 0 {
+		return Unknown
+	} else {
 		return t
 	}
-	return Unknown
+}
+
+// Pod saves the rule for matching the traffic of pods
+type Pod struct {
+	Mode        uint32
+	Namespace   string
+	PodSelector *metav1.LabelSelector
+	Ports       []varmor.Port
+}
+
+// Service saves the rule for matching the traffic of services and endpointslices
+type Service struct {
+	Mode            uint32
+	Namespace       string
+	Name            string
+	ServiceSelector *metav1.LabelSelector
+}
+
+// EgressInfo caches the pod and service rules that a policy wants to match.
+type EgressInfo struct {
+	ToPods     []Pod
+	ToServices []Service
 }

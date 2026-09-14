@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package apparmor interacts with the AppArmor LSM
 package apparmor
 
 import (
 	"bufio"
-	"encoding/base64"
 	"fmt"
 	"html/template"
 	"io"
@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
 	lsmutils "github.com/bytedance/vArmor/pkg/lsm/utils"
 )
 
@@ -54,9 +55,8 @@ func retrieveTemplateData() (*templateData, error) {
 }
 
 func SaveAppArmorProfile(fileName string, content string) error {
-	templateContent, err := base64.StdEncoding.DecodeString(content)
-	if err != nil {
-		return err
+	if !strings.Contains(content, "profile") {
+		return fmt.Errorf("the apparmor profile is invalid")
 	}
 
 	f, err := os.Create(fileName)
@@ -70,7 +70,7 @@ func SaveAppArmorProfile(fileName string, content string) error {
 		return err
 	}
 
-	return generateAppArmorProfile(string(templateContent), templateData, f)
+	return generateAppArmorProfile(content, templateData, f)
 }
 
 func aaParser(args ...string) (string, error) {
@@ -81,22 +81,22 @@ func aaParser(args ...string) (string, error) {
 	return string(out), nil
 }
 
-func LoadAppArmorProfile(path string, mode string) (string, error) {
+func LoadAppArmorProfile(path string, mode varmor.ProfileMode) (string, error) {
 	switch mode {
-	case "enforce":
+	case varmor.ProfileModeEnforce:
 		return aaParser("-Ka", path)
-	case "complain":
+	case varmor.ProfileModeComplain:
 		return aaParser("-KaC", path)
 	default:
 		return "", fmt.Errorf("vArmor doesn't support '%s' mode", mode)
 	}
 }
 
-func UpdateAppArmorProfile(path string, mode string) (string, error) {
+func UpdateAppArmorProfile(path string, mode varmor.ProfileMode) (string, error) {
 	switch mode {
-	case "enforce":
+	case varmor.ProfileModeEnforce:
 		return aaParser("-Kr", path)
-	case "complain":
+	case varmor.ProfileModeComplain:
 		return aaParser("-KrC", path)
 	default:
 		return "", fmt.Errorf("vArmor doesn't support '%s' mode", mode)

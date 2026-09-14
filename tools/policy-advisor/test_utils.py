@@ -1,5 +1,5 @@
 import unittest
-from utils import files_conflict_with_rule
+from utils import files_conflict_with_rule, retrieve_executions_from_behavior_data
 
 class TestFunctions(unittest.TestCase):
   def test_files_conflict_with_rule(self):
@@ -7,7 +7,7 @@ class TestFunctions(unittest.TestCase):
       "disable-write-etc": {
         "rules": [
             {
-              "path_regex": "^\/etc$|^\/etc\/|\/containerd\/.*\/fs\/root\/etc$|\/containerd\/.*\/fs\/root\/etc\/",
+              "path_regex": r"^\/etc$|^\/etc\/|\/containerd\/.*\/fs\/root\/etc$|\/containerd\/.*\/fs\/root\/etc\/",
               "permissions": [
                 "w",
                 "a"
@@ -89,7 +89,7 @@ class TestFunctions(unittest.TestCase):
       "mitigate-sa-leak": {
         "rules": [
           {
-            "path_regex": "\/run\/secrets\/kubernetes.io\/serviceaccount\/",
+            "path_regex": r"\/run\/secrets\/kubernetes.io\/serviceaccount\/",
             "permissions": [
               "r"
             ]
@@ -140,7 +140,7 @@ class TestFunctions(unittest.TestCase):
       "mitigate-disk-device-number-leak": {
         "rules": [
             {
-              "path_regex": "\/proc\/partitions|\/proc\/.*\/mountinfo",
+              "path_regex": r"\/proc\/partitions|\/proc\/.*\/mountinfo",
               "permissions": [
                 "r"
               ]
@@ -238,7 +238,7 @@ class TestFunctions(unittest.TestCase):
       "mitigate-overlayfs-leak": {
         "rules": [
             {
-              "path_regex": "\/proc\/mounts|\/proc\/.*\/mounts|\/proc\/.*\/mountinfo",
+              "path_regex": r"\/proc\/mounts|\/proc\/.*\/mounts|\/proc\/.*\/mountinfo",
               "permissions": [
                 "r"
               ]
@@ -289,7 +289,7 @@ class TestFunctions(unittest.TestCase):
       "mitigate-host-ip-leak": {
         "rules": [
           {
-            "path_regex": "\/proc\/net\/arp|\/proc\/.*\/net\/arp",
+            "path_regex": r"\/proc\/net\/arp|\/proc\/.*\/net\/arp",
             "permissions": [
               "r"
             ]
@@ -379,7 +379,7 @@ class TestFunctions(unittest.TestCase):
       "cgroups-lxcfs-escape-mitigation": {
         "rules": [
           {
-            "path_regex": "\/release_agent$|\/devices\/devices.allow$|\/devices\/.*\/devices.allow$|\/devices\/cgroup.procs$|\/devices\/.*\/cgroup.procs$|\/devices\/tasks$|\/devices\/.*\/tasks$",
+            "path_regex": r"\/release_agent$|\/devices\/devices.allow$|\/devices\/.*\/devices.allow$|\/devices\/cgroup.procs$|\/devices\/.*\/cgroup.procs$|\/devices\/tasks$|\/devices\/.*\/tasks$",
             "permissions": [
               "w",
               "a"
@@ -449,6 +449,47 @@ class TestFunctions(unittest.TestCase):
       for index, testcase in enumerate(value["testcases"]):
         print("Run testcase %d" % index)
         self.assertEqual(files_conflict_with_rule(value["rules"], testcase["files"]), testcase["conflict"])
+
+  def test_retrieve_executions_from_behavior_data(self):
+    # Script files executed via binfmt_script are recorded by their script path
+    # (e.g. /var/lib/cilium/bpf/init.sh) without the sh/bash/dash interpreter
+    # binary. The extractor must additionally emit the extension token (.sh) so
+    # that rules like disable-shell can detect shell usage in such cases.
+    testcases = [
+      {
+        "behavior_data": {
+          "data": {
+            "dynamicResult": {
+              "appArmor": {
+                "executions": ["/var/lib/cilium/bpf/init.sh", "/usr/bin/curl"]
+              },
+              "bpf": {
+                "executions": ["/opt/entrypoint.py"]
+              }
+            }
+          }
+        },
+        "expected": ["init.sh", ".sh", "curl", "entrypoint.py", ".py"]
+      },
+      {
+        # No extension -> only the basename is emitted (no empty ext token).
+        "behavior_data": {
+          "data": {
+            "dynamicResult": {
+              "appArmor": {
+                "executions": ["/bin/bash", "/usr/local/bin/node"]
+              }
+            }
+          }
+        },
+        "expected": ["bash", "node"]
+      }
+    ]
+
+    print("------- retrieve_executions_from_behavior_data -------")
+    for index, testcase in enumerate(testcases):
+      print("Run testcase %d" % index)
+      self.assertEqual(retrieve_executions_from_behavior_data(testcase["behavior_data"]), testcase["expected"])
 
 if __name__ == '__main__':
     unittest.main()

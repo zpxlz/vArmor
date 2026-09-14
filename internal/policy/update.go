@@ -17,7 +17,9 @@ package policy
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +28,10 @@ import (
 	appsV1 "k8s.io/api/apps/v1"
 	coreV1 "k8s.io/api/core/v1"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	"k8s.io/client-go/util/retry"
 
@@ -38,16 +42,547 @@ import (
 	varmorinterface "github.com/bytedance/vArmor/pkg/client/clientset/versioned/typed/varmor/v1beta1"
 )
 
-func modifyDeploymentAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicyMode, target varmor.Target, deploy *appsV1.Deployment, profileName string, bpfExclusiveMode bool) {
+// AuditNodeMetadataOverlay is the Envoy "--config-yaml" overlay that supplies
+// the Pod identity in node.metadata. It is layered on top of the static
+// bootstrap (-c /etc/envoy/bootstrap.yaml): Envoy proto-merges this node onto
+// the bootstrap node, so id/cluster stay from the file and metadata is added
+// here. The $(POD_*) references are expanded by the kubelet from the sidecar's
+// Downward API env vars (POD_NAME / POD_NAMESPACE / POD_UID) before Envoy
+// starts. The keys MUST match the node.metadata keys the audit agent reads
+// (see internal/auditor). This replaces the unsupported "%ENV()%"-in-node.metadata
+// approach: Envoy only expands that command operator in access-log format
+// strings, never inside node.metadata at bootstrap load.
+const AuditNodeMetadataOverlay = `node:
+  metadata:
+    pod_name: "$(POD_NAME)"
+    pod_namespace: "$(POD_NAMESPACE)"
+    pod_uid: "$(POD_UID)"`
+
+var (
+	// scriptTemplate builds the proxy-init shell script executed via "sh -c"
+	// for the controller-managed injection path (Deployment/StatefulSet/
+	// DaemonSet). It is kept logically identical to iptablesScript in
+	// internal/webhooks/mutation.go: it asks the varmor-choose-backend helper
+	// (shipped in the proxyinit image) which iptables backend is already in use
+	// in the target Pod netns and drives all rules through that backend
+	// (${IPT}/${IPT6}). Fresh netns -> nft (previous default); both backends
+	// carry rules -> the helper prints CONFLICT and the script aborts.
+	scriptTemplate = `set -ex
+ENVOY_UID=%d
+ENVOY_PORT=%d
+ENVOY_ADMIN_PORT=%d
+IPT=$(/usr/local/bin/varmor-choose-backend iptables-legacy iptables-nft)
+IPT6=$(/usr/local/bin/varmor-choose-backend ip6tables-legacy ip6tables-nft)
+if [ ${IPT} = CONFLICT ]; then echo varmor-proxy-init: both legacy and nft rules present in netns, refusing to inject; exit 1; fi
+if [ ${IPT6} = CONFLICT ]; then echo varmor-proxy-init: both legacy and nft ipv6 rules present in netns, refusing to inject; exit 1; fi
+${IPT} -t nat -N VARMOR_OUTPUT
+${IPT} -t nat -N VARMOR_REDIRECT
+${IPT} -t nat -A OUTPUT -p tcp -j VARMOR_OUTPUT
+${IPT} -t nat -A VARMOR_OUTPUT -m owner --uid-owner ${ENVOY_UID} -j RETURN
+${IPT} -t nat -A VARMOR_OUTPUT -d 127.0.0.0/8 -j RETURN
+${IPT} -t nat -A VARMOR_OUTPUT -p tcp -j VARMOR_REDIRECT
+${IPT} -t nat -A VARMOR_REDIRECT -p tcp -j REDIRECT --to-ports ${ENVOY_PORT}
+${IPT} -t filter -A OUTPUT -p tcp --dport ${ENVOY_ADMIN_PORT} -m owner ! --uid-owner ${ENVOY_UID} -j DROP
+${IPT6} -t nat -N VARMOR_OUTPUT
+${IPT6} -t nat -N VARMOR_REDIRECT
+${IPT6} -t nat -A OUTPUT -p tcp -j VARMOR_OUTPUT
+${IPT6} -t nat -A VARMOR_OUTPUT -m owner --uid-owner ${ENVOY_UID} -j RETURN
+${IPT6} -t nat -A VARMOR_OUTPUT -d ::1/128 -j RETURN
+${IPT6} -t nat -A VARMOR_OUTPUT -p tcp -j VARMOR_REDIRECT
+${IPT6} -t nat -A VARMOR_REDIRECT -p tcp -j REDIRECT --to-ports ${ENVOY_PORT}
+${IPT6} -t filter -A OUTPUT -p tcp --dport ${ENVOY_ADMIN_PORT} -m owner ! --uid-owner ${ENVOY_UID} -j DROP`
+
+	proxyInitContainer = coreV1.Container{
+		Name:  "varmor-network-proxy-init",
+		Image: varmorconfig.ProxyInitImage,
+		SecurityContext: &coreV1.SecurityContext{
+			Capabilities: &coreV1.Capabilities{
+				Add: []coreV1.Capability{"NET_ADMIN"},
+			},
+		},
+		Resources: coreV1.ResourceRequirements{
+			Requests: coreV1.ResourceList{
+				coreV1.ResourceCPU:    resource.MustParse("10m"),
+				coreV1.ResourceMemory: resource.MustParse("16Mi"),
+			},
+		},
+		Command: []string{}, // Set Command with script
+	}
+
+	proxyContainer = coreV1.Container{
+		Name:            "varmor-network-proxy",
+		Image:           varmorconfig.ProxyImage,
+		SecurityContext: &coreV1.SecurityContext{}, // Set RunAsUser with proxyUID
+		// The "--config-yaml" overlay carries the Pod identity into
+		// node.metadata. Its $(POD_*) references are expanded by the kubelet
+		// from the sidecar's Downward API env vars before Envoy starts, then
+		// Envoy merges the overlay node onto the static bootstrap node. This
+		// replaces the unsupported "%ENV()%"-in-node.metadata approach (Envoy
+		// only expands that operator in access-log format strings).
+		Args: []string{"-c", "/etc/envoy/bootstrap.yaml", "--config-yaml", AuditNodeMetadataOverlay, "-l", "info"},
+		ReadinessProbe: &coreV1.Probe{
+			ProbeHandler: coreV1.ProbeHandler{
+				TCPSocket: &coreV1.TCPSocketAction{
+					Port: intstr.IntOrString{Type: intstr.Int, IntVal: 0}, // Set IntVal with ProxyPort
+				},
+			},
+			InitialDelaySeconds: 2,
+			PeriodSeconds:       5,
+		},
+		// Resources is set at runtime by ResolveProxyResources() based on
+		// MITM status and user overrides — see modifyXxxAnnotationsAndEnv().
+		VolumeMounts: []coreV1.VolumeMount{
+			{
+				Name:      "varmor-network-proxy-config",
+				MountPath: "/etc/envoy",
+				ReadOnly:  true,
+			},
+		},
+	}
+
+	proxyVolume = coreV1.Volume{
+		Name: "varmor-network-proxy-config",
+		VolumeSource: coreV1.VolumeSource{
+			Secret: &coreV1.SecretVolumeSource{
+				// Name set per-policy at runtime.
+				// Items is explicit to avoid projecting MITM key material
+				// (mitm-ca.key, mitm-leaf.key, etc.) into /etc/envoy/.
+				Items: []coreV1.KeyToPath{
+					{Key: "bootstrap.yaml", Path: "bootstrap.yaml"},
+					{Key: "lds.yaml", Path: "lds.yaml"},
+					{Key: "cds.yaml", Path: "cds.yaml"},
+				},
+			},
+		},
+	}
+
+	// proxyMITMTLSVolume projects the per-policy MITM leaf cert, leaf key
+	// and upstream CA bundle into the Envoy sidecar at /etc/envoy/tls.
+	proxyMITMTLSVolume = coreV1.Volume{
+		Name: "varmor-network-proxy-mitm-tls",
+		VolumeSource: coreV1.VolumeSource{
+			Secret: &coreV1.SecretVolumeSource{
+				// Name set per-policy at runtime.
+				Items: []coreV1.KeyToPath{
+					{Key: "mitm-leaf.crt", Path: "leaf.crt"},
+					{Key: "mitm-leaf.key", Path: "leaf.key"},
+					{Key: "mitm-ca-bundle.crt", Path: "ca-bundle.crt"},
+				},
+			},
+		},
+	}
+
+	// proxyMITMCABundleVolume projects the concatenated Mozilla + vArmor-CA
+	// trust bundle into application containers at /etc/varmor/ca-bundle.
+	proxyMITMCABundleVolume = coreV1.Volume{
+		Name: "varmor-network-proxy-mitm-ca-bundle",
+		VolumeSource: coreV1.VolumeSource{
+			Secret: &coreV1.SecretVolumeSource{
+				// Name set per-policy at runtime.
+				Items: []coreV1.KeyToPath{
+					{Key: "mitm-ca-bundle.crt", Path: "ca-certificates.crt"},
+				},
+			},
+		},
+	}
+
+	// proxyMITMTLSVolumeMount is appended to the Envoy sidecar container
+	// when MITM is enabled.
+	proxyMITMTLSVolumeMount = coreV1.VolumeMount{
+		Name:      "varmor-network-proxy-mitm-tls",
+		MountPath: "/etc/envoy/tls",
+		ReadOnly:  true,
+	}
+
+	// proxyMITMCABundleVolumeMount is injected into each target container
+	// when MITM is enabled.
+	proxyMITMCABundleVolumeMount = coreV1.VolumeMount{
+		Name:      "varmor-network-proxy-mitm-ca-bundle",
+		MountPath: varmorconfig.MITMCABundleMountDir,
+		ReadOnly:  true,
+	}
+
+	// mitmCABundleEnvVars are injected into each target container so that
+	// common TLS runtimes trust the vArmor MITM CA automatically.
+	mitmCABundleEnvVars = []coreV1.EnvVar{
+		{Name: "SSL_CERT_FILE", Value: varmorconfig.MITMCABundlePath},
+		{Name: "REQUESTS_CA_BUNDLE", Value: varmorconfig.MITMCABundlePath},
+		{Name: "NODE_EXTRA_CA_CERTS", Value: varmorconfig.MITMCABundlePath},
+		{Name: "CURL_CA_BUNDLE", Value: varmorconfig.MITMCABundlePath},
+	}
+
+	// proxyAuditALSVolume projects the node-local ALS socket directory into
+	// the Envoy sidecar as a hostPath volume so the sidecar can connect to
+	// the agent's ALS server over the shared Unix domain socket. The leaf
+	// socketDir (not the gate directory and not the socket file) is mounted
+	// so the sidecar reconnects automatically after the agent recreates the
+	// socket inode.
+	hostPathDirectoryOrCreate = coreV1.HostPathDirectoryOrCreate
+	proxyAuditALSVolume       = coreV1.Volume{
+		Name: varmorconfig.AuditNetworkProxyVolumeName,
+		VolumeSource: coreV1.VolumeSource{
+			HostPath: &coreV1.HostPathVolumeSource{
+				Path: varmorconfig.AuditNetworkProxySocketDir,
+				Type: &hostPathDirectoryOrCreate,
+			},
+		},
+	}
+
+	// proxyAuditALSVolumeMount mounts the ALS socket directory into the Envoy
+	// sidecar at the same absolute path the agent listens on, so the CDS
+	// cluster pipe.path resolves identically on both sides. This mount is only
+	// injected on runc (kata omits the hostPath volume entirely), where Envoy
+	// merely connects to the node agent's socket as a gRPC client and never
+	// writes to the directory, so it is mounted read-only. The kata in-sidecar
+	// sink binds its socket in the container's own rootfs, needing no mount.
+	proxyAuditALSVolumeMount = coreV1.VolumeMount{
+		Name:      varmorconfig.AuditNetworkProxyVolumeName,
+		MountPath: varmorconfig.AuditNetworkProxySocketDir,
+		ReadOnly:  true,
+	}
+
+	// auditDownwardAPIEnvVars carry the Pod identity into the Envoy sidecar
+	// via the Kubernetes Downward API. The kubelet expands the $(POD_*)
+	// references in the sidecar's "--config-yaml" overlay (see
+	// AuditNodeMetadataOverlay) from these env vars before Envoy starts, so
+	// the agent can attribute ALS records to a precise Pod.
+	auditDownwardAPIEnvVars = []coreV1.EnvVar{
+		{
+			Name: "POD_NAME",
+			ValueFrom: &coreV1.EnvVarSource{
+				FieldRef: &coreV1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &coreV1.EnvVarSource{
+				FieldRef: &coreV1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
+		{
+			Name: "POD_UID",
+			ValueFrom: &coreV1.EnvVarSource{
+				FieldRef: &coreV1.ObjectFieldSelector{FieldPath: "metadata.uid"},
+			},
+		},
+	}
+)
+
+// AuditPolicyIdentity carries the owning policy's Kind/Name/Namespace down the
+// injection chain so the in-sidecar kata audit sink can attribute violation
+// records to the policy. It mirrors auditor.PolicyIdentity but is kept local to
+// the injection path to avoid importing the auditor package here.
+type AuditPolicyIdentity struct {
+	// Kind is "VarmorPolicy" or "VarmorClusterPolicy".
+	Kind string
+	// Name is the policy's metadata.name.
+	Name string
+	// Namespace is the policy's namespace for a namespaced VarmorPolicy, and an
+	// empty string for a cluster-scoped VarmorClusterPolicy.
+	Namespace string
+}
+
+// auditSinkNodeNameEnvVar carries the virtual node name into the Envoy sidecar
+// via the Downward API. The in-sidecar kata audit sink reads NODE_NAME to
+// attribute every violation record to the node hosting the kata Pod. On runc it
+// is unused (the node-central agent supplies the node name), which keeps the
+// sidecar env identical across runtimes (zero fork).
+var auditSinkNodeNameEnvVar = coreV1.EnvVar{
+	Name: "NODE_NAME",
+	ValueFrom: &coreV1.EnvVarSource{
+		FieldRef: &coreV1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+	},
+}
+
+// auditSinkEnvNames enumerates the sink-only env var names so cleanup can strip
+// them idempotently when the NetworkProxy enforcer is removed.
+var auditSinkEnvNames = map[string]bool{
+	"NODE_NAME":            true,
+	"PROFILE_NAME":         true,
+	"POLICY_KIND":          true,
+	"POLICY_NAME":          true,
+	"POLICY_NAMESPACE":     true,
+	"VARMOR_NAMESPACE":     true,
+	"VARMOR_ENVOY_UID":     true,
+	"AUDIT_EVENT_METADATA": true,
+}
+
+// auditSinkEnvVars builds the env vars consumed by the in-sidecar kata audit
+// sink. They are injected on every sidecar (runc and kata) so the custom Envoy
+// image stays runtime-agnostic; on runc the entrypoint's connect(2) self-check
+// succeeds and the sink is never started, so the values are simply unused.
+//
+//   - NODE_NAME (Downward API spec.nodeName): node attribution.
+//   - PROFILE_NAME / POLICY_KIND / POLICY_NAME / POLICY_NAMESPACE: the policy
+//     identity the sink seeds so violation records carry the owning policy.
+//   - VARMOR_NAMESPACE: the namespace where vArmor itself is installed.
+//   - VARMOR_ENVOY_UID: the uid the entrypoint drops to before exec-ing Envoy,
+//     kept in sync with the iptables uid-owner RETURN exemption (proxyUID).
+//   - AUDIT_EVENT_METADATA: the cluster metadata literal the manager carries,
+//     so the sink produces records matching the node-central agent. Omitted
+//     when the manager has no such metadata configured.
+func auditSinkEnvVars(profileName string, id AuditPolicyIdentity, proxyUID int64) []coreV1.EnvVar {
+	envs := []coreV1.EnvVar{
+		auditSinkNodeNameEnvVar,
+		{Name: "PROFILE_NAME", Value: profileName},
+		{Name: "POLICY_KIND", Value: id.Kind},
+		{Name: "POLICY_NAME", Value: id.Name},
+		{Name: "POLICY_NAMESPACE", Value: id.Namespace},
+		{Name: "VARMOR_NAMESPACE", Value: varmorconfig.Namespace},
+		{Name: "VARMOR_ENVOY_UID", Value: strconv.FormatInt(proxyUID, 10)},
+	}
+	if md := os.Getenv("AUDIT_EVENT_METADATA"); md != "" {
+		envs = append(envs, coreV1.EnvVar{Name: "AUDIT_EVENT_METADATA", Value: md})
+	}
+	return envs
+}
+
+// cleanupAuditFromSidecar removes the ALS socket volumeMount, the Downward API
+// env vars, and all in-sidecar audit sink env vars from the Envoy sidecar if
+// present, keeping reconciliation idempotent when the NetworkProxy enforcer is
+// removed.
+func cleanupAuditFromSidecar(containers []coreV1.Container) {
+	for i := range containers {
+		if containers[i].Name != proxyContainer.Name {
+			continue
+		}
+		filteredMounts := containers[i].VolumeMounts[:0]
+		for _, vm := range containers[i].VolumeMounts {
+			if vm.Name != proxyAuditALSVolumeMount.Name {
+				filteredMounts = append(filteredMounts, vm)
+			}
+		}
+		containers[i].VolumeMounts = filteredMounts
+
+		auditEnvNames := map[string]bool{"POD_NAME": true, "POD_NAMESPACE": true, "POD_UID": true}
+		filteredEnv := containers[i].Env[:0]
+		for _, ev := range containers[i].Env {
+			if !auditEnvNames[ev.Name] && !auditSinkEnvNames[ev.Name] {
+				filteredEnv = append(filteredEnv, ev)
+			}
+		}
+		containers[i].Env = filteredEnv
+		break
+	}
+}
+
+// cleanupAuditVolumes removes the ALS socket hostPath volume from a PodSpec.
+func cleanupAuditVolumes(volumes *[]coreV1.Volume) {
+	filtered := (*volumes)[:0]
+	for _, v := range *volumes {
+		if v.Name != proxyAuditALSVolume.Name {
+			filtered = append(filtered, v)
+		}
+	}
+	*volumes = filtered
+}
+
+// applyAuditToSidecar appends the Downward API Pod identity env vars and the
+// audit sink env vars (node name, policy identity, drop-privilege uid and
+// cluster metadata) to the Envoy sidecar container. On runc it also appends the
+// shared ALS socket volumeMount so Envoy can connect to the node agent's socket;
+// on a micro-VM (microVM == true) the volumeMount is omitted because no hostPath volume
+// is injected and the in-sidecar sink binds the socket in the container's own
+// writable rootfs. The env vars are injected in both cases (runc's entrypoint
+// self-check succeeds and simply ignores the unused sink env vars).
+func applyAuditToSidecar(containers []coreV1.Container, profileName string, id AuditPolicyIdentity, proxyUID int64, microVM bool) {
+	for i := range containers {
+		if containers[i].Name == proxyContainer.Name {
+			if !microVM {
+				containers[i].VolumeMounts = append(containers[i].VolumeMounts, proxyAuditALSVolumeMount)
+			}
+			containers[i].Env = append(containers[i].Env, auditDownwardAPIEnvVars...)
+			containers[i].Env = append(containers[i].Env, auditSinkEnvVars(profileName, id, proxyUID)...)
+			break
+		}
+	}
+}
+
+// applyAuditVolumes appends the ALS socket hostPath volume to a PodSpec. It is a
+// no-op on a micro-VM (microVM == true): serverless/micro-VM providers (e.g. Volcengine
+// VCI) reject hostPath volumes at admission, so the Pod would never schedule.
+// On kata the in-sidecar sink binds the socket in the container's own rootfs and
+// needs no volume.
+func applyAuditVolumes(volumes *[]coreV1.Volume, microVM bool) {
+	if microVM {
+		return
+	}
+	*volumes = append(*volumes, *proxyAuditALSVolume.DeepCopy())
+}
+
+// isMITMEnabled returns true when MITM TLS interception is configured on the
+// NetworkProxy policy.
+func isMITMEnabled(proxyConfig *varmor.NetworkProxyConfig) bool {
+	return proxyConfig != nil && proxyConfig.MITM != nil && len(proxyConfig.MITM.Domains) > 0
+}
+
+// proxyResourceOverride extracts the Resources override from the
+// NetworkProxyConfig, returning nil if the config is nil or no override
+// is specified.
+func proxyResourceOverride(proxyConfig *varmor.NetworkProxyConfig) *varmor.ProxyResourceOverride {
+	if proxyConfig == nil {
+		return nil
+	}
+	return proxyConfig.Resources
+}
+
+// cleanupMITMVolumes removes the two MITM-specific volumes from a PodSpec.
+// It is called during the cleanup phase of each modify*AnnotationsAndEnv
+// function to ensure idempotent reconciliation.
+func cleanupMITMVolumes(volumes *[]coreV1.Volume) {
+	mitmVolumeNames := map[string]bool{
+		proxyMITMTLSVolume.Name:      true,
+		proxyMITMCABundleVolume.Name: true,
+	}
+	filtered := (*volumes)[:0]
+	for _, v := range *volumes {
+		if !mitmVolumeNames[v.Name] {
+			filtered = append(filtered, v)
+		}
+	}
+	*volumes = filtered
+}
+
+// cleanupMITMFromSidecar removes the MITM TLS volumeMount from the Envoy
+// sidecar container if present.
+func cleanupMITMFromSidecar(containers []coreV1.Container) {
+	for i := range containers {
+		if containers[i].Name != proxyContainer.Name {
+			continue
+		}
+		filtered := containers[i].VolumeMounts[:0]
+		for _, vm := range containers[i].VolumeMounts {
+			if vm.Name != proxyMITMTLSVolumeMount.Name {
+				filtered = append(filtered, vm)
+			}
+		}
+		containers[i].VolumeMounts = filtered
+		break
+	}
+}
+
+// cleanupMITMFromTargetContainers removes the MITM CA bundle volumeMount and
+// the four TLS env vars from each target container. Non-target containers
+// (determined by target.Containers) are left untouched.
+func cleanupMITMFromTargetContainers(containers []coreV1.Container, target varmor.Target) {
+	for i := range containers {
+		if containers[i].Name == proxyContainer.Name || containers[i].Name == proxyInitContainer.Name {
+			continue
+		}
+		if len(target.Containers) != 0 && !varmorutils.InStringArray(containers[i].Name, target.Containers) {
+			continue
+		}
+		// Remove MITM volumeMount
+		filtered := containers[i].VolumeMounts[:0]
+		for _, vm := range containers[i].VolumeMounts {
+			if vm.Name != proxyMITMCABundleVolumeMount.Name {
+				filtered = append(filtered, vm)
+			}
+		}
+		containers[i].VolumeMounts = filtered
+		// Remove MITM env vars
+		mitmEnvNames := map[string]bool{
+			"SSL_CERT_FILE": true, "REQUESTS_CA_BUNDLE": true,
+			"NODE_EXTRA_CA_CERTS": true, "CURL_CA_BUNDLE": true,
+		}
+		filteredEnv := containers[i].Env[:0]
+		for _, ev := range containers[i].Env {
+			if !mitmEnvNames[ev.Name] {
+				filteredEnv = append(filteredEnv, ev)
+			}
+		}
+		containers[i].Env = filteredEnv
+	}
+}
+
+// applyMITMToSidecar appends the MITM TLS volumeMount to the Envoy sidecar
+// container.
+func applyMITMToSidecar(containers []coreV1.Container) {
+	for i := range containers {
+		if containers[i].Name == proxyContainer.Name {
+			containers[i].VolumeMounts = append(containers[i].VolumeMounts, proxyMITMTLSVolumeMount)
+			break
+		}
+	}
+}
+
+// applyMITMVolumes appends the two MITM volumes and sets their SecretName
+// name to profileName.
+func applyMITMVolumes(volumes *[]coreV1.Volume, profileName string) {
+	tlsVol := proxyMITMTLSVolume.DeepCopy()
+	tlsVol.Secret.SecretName = profileName
+	*volumes = append(*volumes, *tlsVol)
+
+	caVol := proxyMITMCABundleVolume.DeepCopy()
+	caVol.Secret.SecretName = profileName
+	*volumes = append(*volumes, *caVol)
+}
+
+// applyMITMToTargetContainers injects the CA bundle volumeMount and four
+// TLS env vars into each target container.
+func applyMITMToTargetContainers(containers []coreV1.Container, target varmor.Target) []coreV1.Container {
+	for i := range containers {
+		if containers[i].Name == proxyContainer.Name || containers[i].Name == proxyInitContainer.Name {
+			continue
+		}
+		if len(target.Containers) != 0 && !varmorutils.InStringArray(containers[i].Name, target.Containers) {
+			continue
+		}
+		containers[i].VolumeMounts = append(containers[i].VolumeMounts, proxyMITMCABundleVolumeMount)
+		containers[i].Env = append(containers[i].Env, mitmCABundleEnvVars...)
+	}
+	return containers
+}
+
+func modifyDeploymentAnnotationsAndEnv(
+	enforcer string,
+	mode varmor.VarmorPolicyMode,
+	target varmor.Target,
+	proxyConfig *varmor.NetworkProxyConfig,
+	deploy *appsV1.Deployment,
+	profileName string,
+	id AuditPolicyIdentity,
+	bpfExclusiveMode bool) {
+
 	e := varmortypes.GetEnforcerType(enforcer)
 
 	// Clean up first
 	for key, value := range deploy.Spec.Template.Annotations {
-		// BPF
-		if (e & varmortypes.BPF) != 0 {
-			if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
-				delete(deploy.Spec.Template.Annotations, key)
+		// NetworkProxy
+		if key == "pod.networkproxy.security.beta.varmor.org" && value != "unconfined" {
+			delete(deploy.Spec.Template.Annotations, key)
+			// Clean up the proxy init container
+			for index, container := range deploy.Spec.Template.Spec.InitContainers {
+				if container.Name == proxyInitContainer.Name {
+					deploy.Spec.Template.Spec.InitContainers = append(deploy.Spec.Template.Spec.InitContainers[:index], deploy.Spec.Template.Spec.InitContainers[index+1:]...)
+					break
+				}
 			}
+			// Clean up the proxy container
+			for index, container := range deploy.Spec.Template.Spec.Containers {
+				if container.Name == proxyContainer.Name {
+					deploy.Spec.Template.Spec.Containers = append(deploy.Spec.Template.Spec.Containers[:index], deploy.Spec.Template.Spec.Containers[index+1:]...)
+					break
+				}
+			}
+			// Clean up the proxy volume
+			for index, volume := range deploy.Spec.Template.Spec.Volumes {
+				if volume.Name == proxyVolume.Name {
+					deploy.Spec.Template.Spec.Volumes = append(deploy.Spec.Template.Spec.Volumes[:index], deploy.Spec.Template.Spec.Volumes[index+1:]...)
+					break
+				}
+			}
+			// Clean up MITM volumes, sidecar mount, and target container mounts/env
+			cleanupMITMVolumes(&deploy.Spec.Template.Spec.Volumes)
+			cleanupMITMFromSidecar(deploy.Spec.Template.Spec.Containers)
+			cleanupMITMFromTargetContainers(deploy.Spec.Template.Spec.Containers, target)
+			// Clean up audit ALS volume, sidecar mount and Downward API env (idempotent)
+			cleanupAuditVolumes(&deploy.Spec.Template.Spec.Volumes)
+			cleanupAuditFromSidecar(deploy.Spec.Template.Spec.Containers)
+		}
+		// BPF
+		if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
+			delete(deploy.Spec.Template.Annotations, key)
 		}
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
@@ -100,7 +635,62 @@ func modifyDeploymentAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicy
 		return
 	}
 
-	// Setting new annotations and seccomp context
+	// NetworkProxy
+	if (e & varmortypes.NetworkProxy) != 0 {
+		if value, ok := deploy.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"]; !ok || value != "unconfined" {
+			proxyUID := varmorconfig.DefaultProxyUID
+			proxyPort := varmorconfig.DefaultProxyPort
+			proxyAdminPort := varmorconfig.DefaultProxyAdminPort
+
+			if proxyConfig != nil {
+				if proxyConfig.ProxyUID != nil {
+					proxyUID = *proxyConfig.ProxyUID
+				}
+				if proxyConfig.ProxyPort != nil {
+					proxyPort = *proxyConfig.ProxyPort
+				}
+				if proxyConfig.ProxyAdminPort != nil {
+					proxyAdminPort = *proxyConfig.ProxyAdminPort
+				}
+			}
+
+			deploy.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"] = fmt.Sprintf("localhost/%s", profileName)
+			// Add a init container
+			script := fmt.Sprintf(scriptTemplate, proxyUID, proxyPort, proxyAdminPort)
+			proxyInitContainer.Command = []string{"sh", "-c", script}
+			deploy.Spec.Template.Spec.InitContainers = append(deploy.Spec.Template.Spec.InitContainers, proxyInitContainer)
+			// Add a proxy sidecar container
+			// Option B (kata): the sidecar always starts as root so the custom
+			// Envoy image entrypoint can run its runtime self-check and, on kata,
+			// bind the in-sidecar audit sink before dropping to the Envoy uid
+			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
+			// harmless: the entrypoint drops to proxyUID immediately.
+			sidecarRunAsUser := int64(0)
+			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
+			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
+			proxyContainer.Resources = ResolveProxyResources(
+				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))
+			deploy.Spec.Template.Spec.Containers = append(deploy.Spec.Template.Spec.Containers, proxyContainer)
+			// Add a volume
+			proxyVolume.Secret.SecretName = profileName
+			deploy.Spec.Template.Spec.Volumes = append(deploy.Spec.Template.Spec.Volumes, proxyVolume)
+
+			// MITM: add TLS volumeMount to sidecar + extra volumes + target container injection
+			if isMITMEnabled(proxyConfig) {
+				applyMITMToSidecar(deploy.Spec.Template.Spec.Containers)
+				applyMITMVolumes(&deploy.Spec.Template.Spec.Volumes, profileName)
+				deploy.Spec.Template.Spec.Containers = applyMITMToTargetContainers(deploy.Spec.Template.Spec.Containers, target)
+			}
+			// Audit: add ALS socket hostPath volume + sidecar mount and
+			// Downward API Pod identity env vars. NetworkProxy violations always
+			// stream over gRPC ALS.
+			microVM := varmorconfig.IsMicroVMPod(deploy.Spec.Template.Labels, deploy.Spec.Template.Annotations, deploy.Spec.Template.Spec.RuntimeClassName)
+			applyAuditToSidecar(deploy.Spec.Template.Spec.Containers, profileName, id, proxyUID, microVM)
+			applyAuditVolumes(&deploy.Spec.Template.Spec.Volumes, microVM)
+		}
+	}
+
+	// Setting new annotations and seccomp context for AppArmor, BPF and Seccomp
 	for index, container := range deploy.Spec.Template.Spec.Containers {
 		if len(target.Containers) != 0 && !varmorutils.InStringArray(container.Name, target.Containers) {
 			continue
@@ -161,7 +751,7 @@ func modifyDeploymentAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicy
 			if deploy.Spec.Template.Spec.Containers[index].SecurityContext == nil {
 				deploy.Spec.Template.Spec.Containers[index].SecurityContext = &coreV1.SecurityContext{}
 			}
-			if mode == varmortypes.RuntimeDefaultMode {
+			if mode == varmor.RuntimeDefaultMode {
 				deploy.Spec.Template.Spec.Containers[index].SecurityContext.SeccompProfile = &coreV1.SeccompProfile{
 					Type: "RuntimeDefault",
 				}
@@ -175,16 +765,54 @@ func modifyDeploymentAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicy
 	}
 }
 
-func modifyStatefulSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicyMode, target varmor.Target, stateful *appsV1.StatefulSet, profileName string, bpfExclusiveMode bool) {
+func modifyStatefulSetAnnotationsAndEnv(
+	enforcer string,
+	mode varmor.VarmorPolicyMode,
+	target varmor.Target,
+	proxyConfig *varmor.NetworkProxyConfig,
+	stateful *appsV1.StatefulSet,
+	profileName string,
+	id AuditPolicyIdentity,
+	bpfExclusiveMode bool) {
 	e := varmortypes.GetEnforcerType(enforcer)
 
 	// Clean up first
 	for key, value := range stateful.Spec.Template.Annotations {
-		// BPF
-		if (e & varmortypes.BPF) != 0 {
-			if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
-				delete(stateful.Spec.Template.Annotations, key)
+		// NetworkProxy
+		if key == "pod.networkproxy.security.beta.varmor.org" && value != "unconfined" {
+			delete(stateful.Spec.Template.Annotations, key)
+			// Clean up the proxy init container
+			for index, container := range stateful.Spec.Template.Spec.InitContainers {
+				if container.Name == proxyInitContainer.Name {
+					stateful.Spec.Template.Spec.InitContainers = append(stateful.Spec.Template.Spec.InitContainers[:index], stateful.Spec.Template.Spec.InitContainers[index+1:]...)
+					break
+				}
 			}
+			// Clean up the proxy container
+			for index, container := range stateful.Spec.Template.Spec.Containers {
+				if container.Name == proxyContainer.Name {
+					stateful.Spec.Template.Spec.Containers = append(stateful.Spec.Template.Spec.Containers[:index], stateful.Spec.Template.Spec.Containers[index+1:]...)
+					break
+				}
+			}
+			// Clean up the proxy volume
+			for index, volume := range stateful.Spec.Template.Spec.Volumes {
+				if volume.Name == proxyVolume.Name {
+					stateful.Spec.Template.Spec.Volumes = append(stateful.Spec.Template.Spec.Volumes[:index], stateful.Spec.Template.Spec.Volumes[index+1:]...)
+					break
+				}
+			}
+			// Clean up MITM volumes, sidecar mount, and target container mounts/env
+			cleanupMITMVolumes(&stateful.Spec.Template.Spec.Volumes)
+			cleanupMITMFromSidecar(stateful.Spec.Template.Spec.Containers)
+			cleanupMITMFromTargetContainers(stateful.Spec.Template.Spec.Containers, target)
+			// Clean up audit ALS volume, sidecar mount and Downward API env (idempotent)
+			cleanupAuditVolumes(&stateful.Spec.Template.Spec.Volumes)
+			cleanupAuditFromSidecar(stateful.Spec.Template.Spec.Containers)
+		}
+		// BPF
+		if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
+			delete(stateful.Spec.Template.Annotations, key)
 		}
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
@@ -237,7 +865,62 @@ func modifyStatefulSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolic
 		return
 	}
 
-	// Setting new annotations and seccomp context
+	// NetworkProxy
+	if (e & varmortypes.NetworkProxy) != 0 {
+		if value, ok := stateful.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"]; !ok || value != "unconfined" {
+			proxyUID := varmorconfig.DefaultProxyUID
+			proxyPort := varmorconfig.DefaultProxyPort
+			proxyAdminPort := varmorconfig.DefaultProxyAdminPort
+
+			if proxyConfig != nil {
+				if proxyConfig.ProxyUID != nil {
+					proxyUID = *proxyConfig.ProxyUID
+				}
+				if proxyConfig.ProxyPort != nil {
+					proxyPort = *proxyConfig.ProxyPort
+				}
+				if proxyConfig.ProxyAdminPort != nil {
+					proxyAdminPort = *proxyConfig.ProxyAdminPort
+				}
+			}
+
+			stateful.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"] = fmt.Sprintf("localhost/%s", profileName)
+			// Add a init container
+			script := fmt.Sprintf(scriptTemplate, proxyUID, proxyPort, proxyAdminPort)
+			proxyInitContainer.Command = []string{"sh", "-c", script}
+			stateful.Spec.Template.Spec.InitContainers = append(stateful.Spec.Template.Spec.InitContainers, proxyInitContainer)
+			// Add a proxy sidecar container
+			// Option B (kata): the sidecar always starts as root so the custom
+			// Envoy image entrypoint can run its runtime self-check and, on kata,
+			// bind the in-sidecar audit sink before dropping to the Envoy uid
+			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
+			// harmless: the entrypoint drops to proxyUID immediately.
+			sidecarRunAsUser := int64(0)
+			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
+			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
+			proxyContainer.Resources = ResolveProxyResources(
+				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))
+			stateful.Spec.Template.Spec.Containers = append(stateful.Spec.Template.Spec.Containers, proxyContainer)
+			// Add a volume
+			proxyVolume.Secret.SecretName = profileName
+			stateful.Spec.Template.Spec.Volumes = append(stateful.Spec.Template.Spec.Volumes, proxyVolume)
+
+			// MITM: add TLS volumeMount to sidecar + extra volumes + target container injection
+			if isMITMEnabled(proxyConfig) {
+				applyMITMToSidecar(stateful.Spec.Template.Spec.Containers)
+				applyMITMVolumes(&stateful.Spec.Template.Spec.Volumes, profileName)
+				stateful.Spec.Template.Spec.Containers = applyMITMToTargetContainers(stateful.Spec.Template.Spec.Containers, target)
+			}
+			// Audit: add ALS socket hostPath volume + sidecar mount and
+			// Downward API Pod identity env vars. NetworkProxy violations always
+			// stream over gRPC ALS.
+			microVM := varmorconfig.IsMicroVMPod(stateful.Spec.Template.Labels, stateful.Spec.Template.Annotations, stateful.Spec.Template.Spec.RuntimeClassName)
+			applyAuditToSidecar(stateful.Spec.Template.Spec.Containers, profileName, id, proxyUID, microVM)
+			applyAuditVolumes(&stateful.Spec.Template.Spec.Volumes, microVM)
+		}
+	}
+
+	// Setting new annotations and seccomp context for AppArmor, BPF and Seccomp
 	for index, container := range stateful.Spec.Template.Spec.Containers {
 		if len(target.Containers) != 0 && !varmorutils.InStringArray(container.Name, target.Containers) {
 			continue
@@ -298,7 +981,7 @@ func modifyStatefulSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolic
 			if stateful.Spec.Template.Spec.Containers[index].SecurityContext == nil {
 				stateful.Spec.Template.Spec.Containers[index].SecurityContext = &coreV1.SecurityContext{}
 			}
-			if mode == varmortypes.RuntimeDefaultMode {
+			if mode == varmor.RuntimeDefaultMode {
 				stateful.Spec.Template.Spec.Containers[index].SecurityContext.SeccompProfile = &coreV1.SeccompProfile{
 					Type: "RuntimeDefault",
 				}
@@ -312,16 +995,54 @@ func modifyStatefulSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolic
 	}
 }
 
-func modifyDaemonSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicyMode, target varmor.Target, daemon *appsV1.DaemonSet, profileName string, bpfExclusiveMode bool) {
+func modifyDaemonSetAnnotationsAndEnv(
+	enforcer string,
+	mode varmor.VarmorPolicyMode,
+	target varmor.Target,
+	proxyConfig *varmor.NetworkProxyConfig,
+	daemon *appsV1.DaemonSet,
+	profileName string,
+	id AuditPolicyIdentity,
+	bpfExclusiveMode bool) {
 	e := varmortypes.GetEnforcerType(enforcer)
 
 	// Clean up first
 	for key, value := range daemon.Spec.Template.Annotations {
-		// BPF
-		if (e & varmortypes.BPF) != 0 {
-			if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
-				delete(daemon.Spec.Template.Annotations, key)
+		// NetworkProxy
+		if key == "pod.networkproxy.security.beta.varmor.org" && value != "unconfined" {
+			delete(daemon.Spec.Template.Annotations, key)
+			// Clean up the proxy init container
+			for index, container := range daemon.Spec.Template.Spec.InitContainers {
+				if container.Name == proxyInitContainer.Name {
+					daemon.Spec.Template.Spec.InitContainers = append(daemon.Spec.Template.Spec.InitContainers[:index], daemon.Spec.Template.Spec.InitContainers[index+1:]...)
+					break
+				}
 			}
+			// Clean up the proxy container
+			for index, container := range daemon.Spec.Template.Spec.Containers {
+				if container.Name == proxyContainer.Name {
+					daemon.Spec.Template.Spec.Containers = append(daemon.Spec.Template.Spec.Containers[:index], daemon.Spec.Template.Spec.Containers[index+1:]...)
+					break
+				}
+			}
+			// Clean up the proxy volume
+			for index, volume := range daemon.Spec.Template.Spec.Volumes {
+				if volume.Name == proxyVolume.Name {
+					daemon.Spec.Template.Spec.Volumes = append(daemon.Spec.Template.Spec.Volumes[:index], daemon.Spec.Template.Spec.Volumes[index+1:]...)
+					break
+				}
+			}
+			// Clean up MITM volumes, sidecar mount, and target container mounts/env
+			cleanupMITMVolumes(&daemon.Spec.Template.Spec.Volumes)
+			cleanupMITMFromSidecar(daemon.Spec.Template.Spec.Containers)
+			cleanupMITMFromTargetContainers(daemon.Spec.Template.Spec.Containers, target)
+			// Clean up audit ALS volume, sidecar mount and Downward API env (idempotent)
+			cleanupAuditVolumes(&daemon.Spec.Template.Spec.Volumes)
+			cleanupAuditFromSidecar(daemon.Spec.Template.Spec.Containers)
+		}
+		// BPF
+		if strings.HasPrefix(key, "container.bpf.security.beta.varmor.org/") && value != "unconfined" {
+			delete(daemon.Spec.Template.Annotations, key)
 		}
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
@@ -374,7 +1095,62 @@ func modifyDaemonSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicyM
 		return
 	}
 
-	// Setting new annotations and seccomp context
+	// NetworkProxy
+	if (e & varmortypes.NetworkProxy) != 0 {
+		if value, ok := daemon.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"]; !ok || value != "unconfined" {
+			proxyUID := varmorconfig.DefaultProxyUID
+			proxyPort := varmorconfig.DefaultProxyPort
+			proxyAdminPort := varmorconfig.DefaultProxyAdminPort
+
+			if proxyConfig != nil {
+				if proxyConfig.ProxyUID != nil {
+					proxyUID = *proxyConfig.ProxyUID
+				}
+				if proxyConfig.ProxyPort != nil {
+					proxyPort = *proxyConfig.ProxyPort
+				}
+				if proxyConfig.ProxyAdminPort != nil {
+					proxyAdminPort = *proxyConfig.ProxyAdminPort
+				}
+			}
+
+			daemon.Spec.Template.Annotations["pod.networkproxy.security.beta.varmor.org"] = fmt.Sprintf("localhost/%s", profileName)
+			// Add a init container
+			script := fmt.Sprintf(scriptTemplate, proxyUID, proxyPort, proxyAdminPort)
+			proxyInitContainer.Command = []string{"sh", "-c", script}
+			daemon.Spec.Template.Spec.InitContainers = append(daemon.Spec.Template.Spec.InitContainers, proxyInitContainer)
+			// Add a proxy sidecar container
+			// Option B (kata): the sidecar always starts as root so the custom
+			// Envoy image entrypoint can run its runtime self-check and, on kata,
+			// bind the in-sidecar audit sink before dropping to the Envoy uid
+			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
+			// harmless: the entrypoint drops to proxyUID immediately.
+			sidecarRunAsUser := int64(0)
+			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
+			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
+			proxyContainer.Resources = ResolveProxyResources(
+				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))
+			daemon.Spec.Template.Spec.Containers = append(daemon.Spec.Template.Spec.Containers, proxyContainer)
+			// Add a volume
+			proxyVolume.Secret.SecretName = profileName
+			daemon.Spec.Template.Spec.Volumes = append(daemon.Spec.Template.Spec.Volumes, proxyVolume)
+
+			// MITM: add TLS volumeMount to sidecar + extra volumes + target container injection
+			if isMITMEnabled(proxyConfig) {
+				applyMITMToSidecar(daemon.Spec.Template.Spec.Containers)
+				applyMITMVolumes(&daemon.Spec.Template.Spec.Volumes, profileName)
+				daemon.Spec.Template.Spec.Containers = applyMITMToTargetContainers(daemon.Spec.Template.Spec.Containers, target)
+			}
+			// Audit: add ALS socket hostPath volume + sidecar mount and
+			// Downward API Pod identity env vars. NetworkProxy violations always
+			// stream over gRPC ALS.
+			microVM := varmorconfig.IsMicroVMPod(daemon.Spec.Template.Labels, daemon.Spec.Template.Annotations, daemon.Spec.Template.Spec.RuntimeClassName)
+			applyAuditToSidecar(daemon.Spec.Template.Spec.Containers, profileName, id, proxyUID, microVM)
+			applyAuditVolumes(&daemon.Spec.Template.Spec.Volumes, microVM)
+		}
+	}
+
+	// Setting new annotations and seccomp context for AppArmor, BPF and Seccomp
 	for index, container := range daemon.Spec.Template.Spec.Containers {
 		if len(target.Containers) != 0 && !varmorutils.InStringArray(container.Name, target.Containers) {
 			continue
@@ -435,7 +1211,7 @@ func modifyDaemonSetAnnotationsAndEnv(enforcer string, mode varmor.VarmorPolicyM
 			if daemon.Spec.Template.Spec.Containers[index].SecurityContext == nil {
 				daemon.Spec.Template.Spec.Containers[index].SecurityContext = &coreV1.SecurityContext{}
 			}
-			if mode == varmortypes.RuntimeDefaultMode {
+			if mode == varmor.RuntimeDefaultMode {
 				daemon.Spec.Template.Spec.Containers[index].SecurityContext.SeccompProfile = &coreV1.SeccompProfile{
 					Type: "RuntimeDefault",
 				}
@@ -455,7 +1231,9 @@ func updateWorkloadAnnotationsAndEnv(
 	enforcer string,
 	mode varmor.VarmorPolicyMode,
 	target varmor.Target,
+	proxyConfig *varmor.NetworkProxyConfig,
 	profileName string,
+	id AuditPolicyIdentity,
 	bpfExclusiveMode bool,
 	logger logr.Logger) {
 
@@ -496,11 +1274,10 @@ func updateWorkloadAnnotationsAndEnv(
 		}
 
 		for _, item := range deploys.Items {
-			needRegain := false
 			deploy := &item
-
+			regain := false
 			updateDeployment := func() error {
-				if needRegain {
+				if regain {
 					deploy, err = appsInterface.Deployments(deploy.Namespace).Get(context.Background(), deploy.Name, metav1.GetOptions{})
 					if err != nil {
 						if k8errors.IsNotFound(err) {
@@ -508,20 +1285,20 @@ func updateWorkloadAnnotationsAndEnv(
 						}
 						return err
 					}
-					needRegain = false
+					regain = false
 				}
 
 				deployOld := deploy.DeepCopy()
-				modifyDeploymentAnnotationsAndEnv(enforcer, mode, target, deploy, profileName, bpfExclusiveMode)
+				modifyDeploymentAnnotationsAndEnv(enforcer, mode, target, proxyConfig, deploy, profileName, id, bpfExclusiveMode)
 				if reflect.DeepEqual(deployOld, deploy) {
 					return nil
 				}
 				deploy.Spec.Template.Annotations["controller.varmor.org/restartedAt"] = time.Now().Format(time.RFC3339)
-				deploy, err = appsInterface.Deployments(deploy.Namespace).Update(context.Background(), deploy, metav1.UpdateOptions{})
+				_, err = appsInterface.Deployments(deploy.Namespace).Update(context.Background(), deploy, metav1.UpdateOptions{})
 				if err == nil {
 					logger.Info("the target workload has been updated", "Kind", "Deployments", "namespace", deploy.Namespace, "name", deploy.Name)
 				} else {
-					needRegain = true
+					regain = true
 				}
 				return err
 			}
@@ -540,11 +1317,10 @@ func updateWorkloadAnnotationsAndEnv(
 		}
 
 		for _, item := range statefuls.Items {
-			needRegain := false
 			stateful := &item
-
+			regain := false
 			updateStateful := func() error {
-				if needRegain {
+				if regain {
 					stateful, err = appsInterface.StatefulSets(stateful.Namespace).Get(context.Background(), stateful.Name, metav1.GetOptions{})
 					if err != nil {
 						if k8errors.IsNotFound(err) {
@@ -552,20 +1328,20 @@ func updateWorkloadAnnotationsAndEnv(
 						}
 						return err
 					}
-					needRegain = false
+					regain = false
 				}
 
 				statefulOld := stateful.DeepCopy()
-				modifyStatefulSetAnnotationsAndEnv(enforcer, mode, target, stateful, profileName, bpfExclusiveMode)
+				modifyStatefulSetAnnotationsAndEnv(enforcer, mode, target, proxyConfig, stateful, profileName, id, bpfExclusiveMode)
 				if reflect.DeepEqual(statefulOld, stateful) {
 					return nil
 				}
 				stateful.Spec.Template.Annotations["controller.varmor.org/restartedAt"] = time.Now().Format(time.RFC3339)
-				stateful, err = appsInterface.StatefulSets(stateful.Namespace).Update(context.Background(), stateful, metav1.UpdateOptions{})
+				_, err = appsInterface.StatefulSets(stateful.Namespace).Update(context.Background(), stateful, metav1.UpdateOptions{})
 				if err == nil {
 					logger.Info("the target workload has been updated", "Kind", "StatefulSets", "namespace", stateful.Namespace, "name", stateful.Name)
 				} else {
-					needRegain = true
+					regain = true
 				}
 				return err
 			}
@@ -588,11 +1364,10 @@ func updateWorkloadAnnotationsAndEnv(
 		}
 
 		for _, item := range daemons.Items {
-			needRegain := false
 			daemon := &item
-
+			regain := false
 			updateDaemon := func() error {
-				if needRegain {
+				if regain {
 					daemon, err = appsInterface.DaemonSets(daemon.Namespace).Get(context.Background(), daemon.Name, metav1.GetOptions{})
 					if err != nil {
 						if k8errors.IsNotFound(err) {
@@ -600,20 +1375,20 @@ func updateWorkloadAnnotationsAndEnv(
 						}
 						return err
 					}
-					needRegain = false
+					regain = false
 				}
 
 				daemonOld := daemon.DeepCopy()
-				modifyDaemonSetAnnotationsAndEnv(enforcer, mode, target, daemon, profileName, bpfExclusiveMode)
-				if reflect.DeepEqual(daemonOld, &daemon) {
+				modifyDaemonSetAnnotationsAndEnv(enforcer, mode, target, proxyConfig, daemon, profileName, id, bpfExclusiveMode)
+				if reflect.DeepEqual(daemonOld, daemon) {
 					return nil
 				}
 				daemon.Spec.Template.Annotations["controller.varmor.org/restartedAt"] = time.Now().Format(time.RFC3339)
-				daemon, err = appsInterface.DaemonSets(daemon.Namespace).Update(context.Background(), daemon, metav1.UpdateOptions{})
+				_, err = appsInterface.DaemonSets(daemon.Namespace).Update(context.Background(), daemon, metav1.UpdateOptions{})
 				if err == nil {
 					logger.Info("the target workload has been updated", "Kind", "DaemonSets", "namespace", daemon.Namespace, "name", daemon.Name)
 				} else {
-					needRegain = true
+					regain = true
 				}
 				return err
 			}
@@ -669,4 +1444,19 @@ func resetArmorProfileModelStatus(varmorInterface varmorinterface.CrdV1beta1Inte
 			_, err = varmorInterface.ArmorProfileModels(namespace).UpdateStatus(context.Background(), apm, metav1.UpdateOptions{})
 			return err
 		})
+}
+
+func policyOwnArmorProfile(obj interface{}, ap *varmor.ArmorProfile, clusterScope bool) bool {
+	if clusterScope {
+		vcp := obj.(*varmor.VarmorClusterPolicy)
+		if len(ap.OwnerReferences) == 1 {
+			return vcp.UID == ap.OwnerReferences[0].UID
+		}
+	} else {
+		vp := obj.(*varmor.VarmorPolicy)
+		if len(ap.OwnerReferences) == 1 {
+			return vp.UID == ap.OwnerReferences[0].UID
+		}
+	}
+	return false
 }

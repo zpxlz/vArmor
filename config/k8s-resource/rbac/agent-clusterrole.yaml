@@ -2,8 +2,6 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: varmor-agent
-  labels:
-    app: varmor
 rules:
 - apiGroups:
   - crd.varmor.org

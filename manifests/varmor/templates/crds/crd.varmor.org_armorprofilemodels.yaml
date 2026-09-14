@@ -3,8 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.11.3
-  creationTimestamp: null
+    controller-gen.kubebuilder.io/version: v0.17.3
   name: armorprofilemodels.crd.varmor.org
 spec:
   group: crd.varmor.org
@@ -16,6 +15,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .storageType
+      name: STORAGE-TYPE
+      type: string
     - jsonPath: .status.desiredNumber
       name: DESIRED
       type: integer
@@ -31,20 +33,28 @@ spec:
     name: v1beta1
     schema:
       openAPIV3Schema:
-        description: ArmorProfileModel is the Schema for the armorprofilemodels API
+        description: |-
+          ArmorProfileModel is the Schema for the armorprofilemodels API
+          ArmorProfileModel is used to store the behavior model and the profiles generated from the DynamicResult and StaticResult.
         properties:
           apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation
-              of an object. Servers should convert recognized schemas to the latest
-              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
             type: string
           data:
-            description: ArmorProfileModelData defines the behavior model and the
-              profile
+            description: |-
+              data contains the behavior model and the profiles.
+              It is used to store the DynamicResult, StaticResult and the generated profiles.
             properties:
               dynamicResult:
+                description: DynamicResult stores the behavior data that has been
+                  collected with the BehaviorModeling mode.
                 properties:
-                  apparmor:
+                  appArmor:
+                    description: AppArmor contains the AppArmor behavior data collected.
                     properties:
                       capabilities:
                         items:
@@ -68,27 +78,38 @@ spec:
                                 type: string
                               type: array
                           required:
-                          - oldPath
-                          - owner
                           - path
                           - permissions
                           type: object
                         type: array
                       networks:
-                        items:
-                          properties:
-                            family:
-                              type: string
-                            protocol:
-                              type: string
-                            sockType:
-                              type: string
-                          required:
-                          - family
-                          - protocol
-                          - sockType
-                          type: object
-                        type: array
+                        properties:
+                          egresses:
+                            items:
+                              properties:
+                                ip:
+                                  type: string
+                                ports:
+                                  items:
+                                    type: integer
+                                  type: array
+                              required:
+                              - ip
+                              - ports
+                              type: object
+                            type: array
+                          sockets:
+                            items:
+                              properties:
+                                domain:
+                                  type: string
+                                protocol:
+                                  type: string
+                                type:
+                                  type: string
+                              type: object
+                            type: array
+                        type: object
                       profiles:
                         items:
                           type: string
@@ -96,6 +117,8 @@ spec:
                       ptraces:
                         items:
                           properties:
+                            external:
+                              type: boolean
                             peer:
                               type: string
                             permissions:
@@ -103,7 +126,6 @@ spec:
                                 type: string
                               type: array
                           required:
-                          - peer
                           - permissions
                           type: object
                         type: array
@@ -131,7 +153,96 @@ spec:
                           type: string
                         type: array
                     type: object
+                  bpf:
+                    description: BPF contains the BPF behavior data collected.
+                    properties:
+                      capabilities:
+                        items:
+                          type: string
+                        type: array
+                      executions:
+                        items:
+                          type: string
+                        type: array
+                      files:
+                        items:
+                          properties:
+                            oldPath:
+                              type: string
+                            owner:
+                              type: boolean
+                            path:
+                              type: string
+                            permissions:
+                              items:
+                                type: string
+                              type: array
+                          required:
+                          - path
+                          - permissions
+                          type: object
+                        type: array
+                      mounts:
+                        items:
+                          properties:
+                            flags:
+                              items:
+                                type: string
+                              type: array
+                            path:
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - path
+                          type: object
+                        type: array
+                      network:
+                        properties:
+                          egresses:
+                            items:
+                              properties:
+                                ip:
+                                  type: string
+                                ports:
+                                  items:
+                                    type: integer
+                                  type: array
+                              required:
+                              - ip
+                              - ports
+                              type: object
+                            type: array
+                          sockets:
+                            items:
+                              properties:
+                                domain:
+                                  type: string
+                                protocol:
+                                  type: string
+                                type:
+                                  type: string
+                              type: object
+                            type: array
+                        type: object
+                      ptraces:
+                        items:
+                          properties:
+                            external:
+                              type: boolean
+                            peer:
+                              type: string
+                            permissions:
+                              items:
+                                type: string
+                              type: array
+                          required:
+                          - permissions
+                          type: object
+                        type: array
+                    type: object
                   seccomp:
+                    description: Seccomp contains the syscalls collected.
                     properties:
                       syscalls:
                         items:
@@ -140,15 +251,30 @@ spec:
                     type: object
                 type: object
               profile:
+                description: Profile stores profiles that are generate from the DynamicResult
+                  and StaticResult.
                 properties:
-                  bpfContent:
+                  appArmor:
+                    type: string
+                  bpf:
                     properties:
                       capabilities:
-                        format: int64
-                        type: integer
+                        properties:
+                          capabilities:
+                            format: int64
+                            type: integer
+                          mode:
+                            format: int32
+                            type: integer
+                        required:
+                        - capabilities
+                        type: object
                       files:
                         items:
                           properties:
+                            mode:
+                              format: int32
+                              type: integer
                             pattern:
                               properties:
                                 flags:
@@ -174,8 +300,11 @@ spec:
                           properties:
                             fstype:
                               type: string
-                            mountFlags:
+                            mode:
                               format: int32
+                              type: integer
+                            mountFlags:
+                              format: int64
                               type: integer
                             pattern:
                               properties:
@@ -190,7 +319,7 @@ spec:
                               - flags
                               type: object
                             reverseMountflags:
-                              format: int32
+                              format: int64
                               type: integer
                           required:
                           - fstype
@@ -203,15 +332,38 @@ spec:
                         items:
                           properties:
                             address:
-                              type: string
-                            cidr:
-                              type: string
+                              properties:
+                                cidr:
+                                  type: string
+                                endPort:
+                                  type: integer
+                                ip:
+                                  type: string
+                                port:
+                                  type: integer
+                                ports:
+                                  items:
+                                    type: integer
+                                  type: array
+                              type: object
                             flags:
                               format: int32
                               type: integer
-                            port:
+                            mode:
                               format: int32
                               type: integer
+                            socket:
+                              properties:
+                                domains:
+                                  format: int64
+                                  type: integer
+                                protocols:
+                                  format: int64
+                                  type: integer
+                                types:
+                                  format: int64
+                                  type: integer
+                              type: object
                           required:
                           - flags
                           type: object
@@ -219,6 +371,9 @@ spec:
                       processes:
                         items:
                           properties:
+                            mode:
+                              format: int32
+                              type: integer
                             pattern:
                               properties:
                                 flags:
@@ -244,20 +399,21 @@ spec:
                           flags:
                             format: int32
                             type: integer
+                          mode:
+                            format: int32
+                            type: integer
                           permissions:
                             format: int32
                             type: integer
                         type: object
                     type: object
-                  content:
-                    type: string
                   enforcer:
                     type: string
                   mode:
                     type: string
                   name:
                     type: string
-                  seccompContent:
+                  seccomp:
                     type: string
                 required:
                 - enforcer
@@ -265,21 +421,31 @@ spec:
                 - name
                 type: object
               staticResult:
+                description: StaticResult stores the static analysis data.
                 type: object
             type: object
           kind:
-            description: 'Kind is a string value representing the REST resource this
-              object represents. Servers may infer this from the endpoint the client
-              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
             type: object
           status:
-            description: ArmorProfileModelStatus defines the observed state of ArmorProfileModel
+            description: status defines the observed state of ArmorProfileModel
             properties:
               completedNumber:
+                description: |-
+                  completedNumber is the number of results that have been received from the agents.
+                  It is used to determine whether the modeling is completed.
+                format: int32
                 type: integer
               conditions:
+                description: conditions is a list of conditions that are used to indicate
+                  the status of the ArmorProfileModel.
                 items:
                   properties:
                     lastTransitionTime:
@@ -292,6 +458,7 @@ spec:
                         the transition.
                       type: string
                     nodeName:
+                      description: The name of the node where the condition is applicable.
                       type: string
                     reason:
                       description: The reason for the condition's last transition.
@@ -309,14 +476,23 @@ spec:
                   type: object
                 type: array
               desiredNumber:
+                description: |-
+                  desiredNumber is the number of desired results to be received from the agents.
+                  It is used to determine whether the modeling is completed.
+                format: int32
                 type: integer
               ready:
-                description: It indicate whether the AppArmor Profile for target is
-                  built successfully
+                description: ready indicate whether the profile is generated and ready
+                  to use.
                 type: boolean
             required:
             - ready
             type: object
+          storageType:
+            description: |-
+              storageType indicates which storage type to use to save the DynamicResult, StaticResult and profiles.
+              Possible values: CRDInternal, LocalDisk
+            type: string
         required:
         - data
         type: object

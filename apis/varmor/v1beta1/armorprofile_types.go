@@ -1,5 +1,5 @@
 /*
-Copyright 2021.
+Copyright The vArmor Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,18 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+type ProfileMode string
+
+const (
+	ProfileModeEnforce  ProfileMode = "enforce"
+	ProfileModeComplain ProfileMode = "complain"
+)
+
+type CapabilitiesContent struct {
+	Mode         uint32 `json:"mode,omitempty"`
+	Capabilities uint64 `json:"capabilities"`
+}
+
 type PathPattern struct {
 	Flags  uint32 `json:"flags"`
 	Prefix string `json:"prefix,omitempty"`
@@ -31,45 +43,64 @@ type PathPattern struct {
 }
 
 type FileContent struct {
+	Mode        uint32      `json:"mode,omitempty"`
 	Permissions uint32      `json:"permissions"`
 	Pattern     PathPattern `json:"pattern"`
 }
 
+type NetworkAddress struct {
+	IP      string   `json:"ip,omitempty"`
+	CIDR    string   `json:"cidr,omitempty"`
+	Port    uint16   `json:"port,omitempty"`
+	EndPort uint16   `json:"endPort,omitempty"`
+	Ports   []uint16 `json:"ports,omitempty"`
+}
+
+type NetworkSocket struct {
+	Domains   uint64 `json:"domains,omitempty"`
+	Types     uint64 `json:"types,omitempty"`
+	Protocols uint64 `json:"protocols,omitempty"`
+}
+
 type NetworkContent struct {
-	Flags   uint32 `json:"flags"`
-	Address string `json:"address,omitempty"`
-	CIDR    string `json:"cidr,omitempty"`
-	Port    uint32 `json:"port,omitempty"`
+	Mode    uint32          `json:"mode,omitempty"`
+	Flags   uint32          `json:"flags"`
+	Socket  *NetworkSocket  `json:"socket,omitempty"`
+	Address *NetworkAddress `json:"address,omitempty"`
 }
 
 type PtraceContent struct {
+	Mode        uint32 `json:"mode,omitempty"`
 	Permissions uint32 `json:"permissions,omitempty"`
 	Flags       uint32 `json:"flags,omitempty"`
 }
 
 type MountContent struct {
-	MountFlags        uint32      `json:"mountFlags"`
+	Mode uint32 `json:"mode,omitempty"`
+	// +kubebuilder:validation:Format=int64
+	MountFlags uint32 `json:"mountFlags"`
+	// +kubebuilder:validation:Format=int64
 	ReverseMountflags uint32      `json:"reverseMountflags"`
-	Fstype            string      `json:"fstype"`
 	Pattern           PathPattern `json:"pattern"`
+	Fstype            string      `json:"fstype"`
 }
 
 type BpfContent struct {
-	Capabilities uint64           `json:"capabilities,omitempty"`
-	Files        []FileContent    `json:"files,omitempty"`
-	Processes    []FileContent    `json:"processes,omitempty"`
-	Networks     []NetworkContent `json:"networks,omitempty"`
-	Ptrace       *PtraceContent   `json:"ptrace,omitempty"`
-	Mounts       []MountContent   `json:"mounts,omitempty"`
+	Capabilities *CapabilitiesContent `json:"capabilities,omitempty"`
+	Files        []FileContent        `json:"files,omitempty"`
+	Processes    []FileContent        `json:"processes,omitempty"`
+	Networks     []NetworkContent     `json:"networks,omitempty"`
+	Ptrace       *PtraceContent       `json:"ptrace,omitempty"`
+	Mounts       []MountContent       `json:"mounts,omitempty"`
 }
 
 type Profile struct {
-	Name           string      `json:"name"`
-	Enforcer       string      `json:"enforcer"`
-	Mode           string      `json:"mode"`
-	Content        string      `json:"content,omitempty"`
-	BpfContent     *BpfContent `json:"bpfContent,omitempty"`
-	SeccompContent string      `json:"seccompContent,omitempty"`
+	Name     string      `json:"name"`
+	Enforcer string      `json:"enforcer"`
+	Mode     ProfileMode `json:"mode"`
+	AppArmor string      `json:"appArmor,omitempty"`
+	Bpf      *BpfContent `json:"bpf,omitempty"`
+	Seccomp  string      `json:"seccomp,omitempty"`
 }
 
 type BehaviorModeling struct {
@@ -79,7 +110,6 @@ type BehaviorModeling struct {
 	Duration int `json:"duration"`
 }
 
-// ArmorProfileSpec defines the desired state of ArmorProfile
 type ArmorProfileSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
@@ -90,10 +120,21 @@ type ArmorProfileSpec struct {
 	UpdateExistingWorkloads bool             `json:"updateExistingWorkloads"`
 }
 
+// ArmorProfileConditionType defines the type of condition for ArmorProfile.
+// +enum
 type ArmorProfileConditionType string
 
+const (
+	// ArmorProfileReady indicates that the ArmorProfile is ready.
+	// This condition is set to True when the desired number of profiles are loaded and the conditions are met.
+	ArmorProfileReady ArmorProfileConditionType = "Ready"
+	// ArmorProfileModelReady indicates that the ArmorProfileModel is ready.
+	// This condition is set to True when the model has been successfully created and is ready for use.
+	ArmorProfileModelReady ArmorProfileModelConditionType = "Ready"
+)
+
 type ArmorProfileCondition struct {
-	// Type of ArmorProfile condition.
+	// Type of condition.
 	Type ArmorProfileConditionType `json:"type"`
 	// Status of the condition, one of True, False, Unknown.
 	Status v1.ConditionStatus `json:"status"`
@@ -105,18 +146,21 @@ type ArmorProfileCondition struct {
 	Reason string `json:"reason,omitempty"`
 	// A human readable message indicating details about the transition.
 	// +optional
-	Message  string `json:"message,omitempty"`
+	Message string `json:"message,omitempty"`
+	// NodeName is the name of the node where the condition is applicable.
 	NodeName string `json:"nodeName"`
 }
 
-// ArmorProfileStatus defines the observed state of ArmorProfile
 type ArmorProfileStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	DesiredNumberLoaded int                     `json:"desiredNumberLoaded"`
-	CurrentNumberLoaded int                     `json:"currentNumberLoaded"`
-	Conditions          []ArmorProfileCondition `json:"conditions,omitempty"`
+	// DesiredNumberLoaded is the desired number of profiles that should be loaded.
+	DesiredNumberLoaded int32 `json:"desiredNumberLoaded"`
+	// CurrentNumberLoaded is the current number of profiles that are loaded.
+	CurrentNumberLoaded int32 `json:"currentNumberLoaded"`
+	// Conditions is a list of conditions that describe the state of the ArmorProfile.
+	Conditions []ArmorProfileCondition `json:"conditions,omitempty"`
 }
 
 //+genclient
@@ -131,11 +175,14 @@ type ArmorProfileStatus struct {
 //+kubebuilder:printcolumn:name="AGE",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ArmorProfile is the Schema for the armorprofiles API
+// It's an internal interface, used by vArmor only.
 type ArmorProfile struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ArmorProfileSpec   `json:"spec"`
+	// Spec defines the profiles for hardening target workloads.
+	Spec ArmorProfileSpec `json:"spec"`
+	// Status defines the observed state of ArmorProfile
 	Status ArmorProfileStatus `json:"status,omitempty"`
 }
 

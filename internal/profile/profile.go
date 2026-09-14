@@ -12,25 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package profile generates the AppArmor/Seccomp/BPF profiles for policies
 package profile
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
+	varmorapm "github.com/bytedance/vArmor/internal/apm"
 	varmorconfig "github.com/bytedance/vArmor/internal/config"
 	apparmorprofile "github.com/bytedance/vArmor/internal/profile/apparmor"
 	bpfprofile "github.com/bytedance/vArmor/internal/profile/bpf"
 	seccompprofile "github.com/bytedance/vArmor/internal/profile/seccomp"
 	varmortypes "github.com/bytedance/vArmor/internal/types"
 	varmorinterface "github.com/bytedance/vArmor/pkg/client/clientset/versioned/typed/varmor/v1beta1"
+	bpfenforcer "github.com/bytedance/vArmor/pkg/lsm/bpfenforcer"
 )
 
-// profileNameTemplate is the name of ArmorProfile object in k8s and AppArmor profile in host machine.
+// profileNameTemplate is the name template for ArmorProfile/ArmorProfileModel objects and AppArmor/Seccomp/BPF profiles.
 //
 //	For namespace-scope profile, its format is "varmor-{VarmorProfile Namespace}-{VarmorProfile Name}"
 //	For cluster-scope profile, its format is "varmor-cluster-{vArmor Namespace}-{VarmorClusterProfile Name}"
@@ -51,146 +55,244 @@ func GenerateArmorProfileName(ns string, name string, clusterScope bool) string 
 	return strings.ToLower(profileName)
 }
 
-func GenerateProfile(policy varmor.Policy, name string, namespace string, varmorInterface varmorinterface.CrdV1beta1Interface, complete bool) (*varmor.Profile, error) {
+func GenerateProfile(
+	kubeClient *kubernetes.Clientset,
+	varmorInterface varmorinterface.CrdV1beta1Interface,
+	policy varmor.Policy,
+	name string, namespace string,
+	complete bool,
+	enableServiceEgressControl bool,
+	enablePodEgressControl bool,
+	logger logr.Logger) (*varmor.Profile, *varmortypes.EgressInfo, error) {
 	var err error
+
+	var egressInfo varmortypes.EgressInfo
 
 	profile := varmor.Profile{
 		Name:     name,
 		Enforcer: policy.Enforcer,
-		Mode:     "enforce",
 	}
 
 	e := varmortypes.GetEnforcerType(policy.Enforcer)
 
 	switch policy.Mode {
-	case varmortypes.AlwaysAllowMode:
+	case varmor.AlwaysAllowMode:
 		if e == varmortypes.Unknown {
-			return nil, fmt.Errorf("unknown enforcer")
+			return nil, nil, fmt.Errorf("unknown enforcer")
 		}
+
+		profile.Mode = varmor.ProfileModeEnforce
+
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
-			profile.Content = apparmorprofile.GenerateAlwaysAllowProfile(name)
+			profile.AppArmor = apparmorprofile.GenerateAlwaysAllowProfile(name)
 		}
 		// BPF
 		if (e & varmortypes.BPF) != 0 {
 			var bpfContent varmor.BpfContent
-			profile.BpfContent = &bpfContent
+			profile.Bpf = &bpfContent
 		}
 		// Seccomp
 		if (e & varmortypes.Seccomp) != 0 {
-			profile.SeccompContent = seccompprofile.GenerateAlwaysAllowProfile()
+			profile.Seccomp = seccompprofile.GenerateAlwaysAllowProfile()
 		}
 
-	case varmortypes.RuntimeDefaultMode:
+	case varmor.RuntimeDefaultMode:
 		if e == varmortypes.Unknown {
-			return nil, fmt.Errorf("unknown enforcer")
+			return nil, nil, fmt.Errorf("unknown enforcer")
 		}
+
+		profile.Mode = varmor.ProfileModeEnforce
+
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
-			profile.Content = apparmorprofile.GenerateRuntimeDefaultProfile(name)
+			profile.AppArmor = apparmorprofile.GenerateRuntimeDefaultProfile(name)
 		}
 		// BPF
 		if (e & varmortypes.BPF) != 0 {
 			var bpfContent varmor.BpfContent
-			err = bpfprofile.GenerateRuntimeDefaultProfile(&bpfContent)
+			err = bpfprofile.GenerateRuntimeDefaultProfile(&bpfContent, bpfenforcer.DenyMode)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			profile.BpfContent = &bpfContent
+			profile.Bpf = &bpfContent
 		}
 		// Seccomp
 		// We need to mock an AlwaysAllow profile when switching a policy to RuntimeDefault mode
 		// in case the containers in existing Pods can normally restart, because we can't update
 		// the Seccomp settings of the existing Pods.
 		if (e & varmortypes.Seccomp) != 0 {
-			profile.SeccompContent = seccompprofile.GenerateAlwaysAllowProfile()
+			profile.Seccomp = seccompprofile.GenerateAlwaysAllowProfile()
 		}
 
-	case varmortypes.EnhanceProtectMode:
+	case varmor.EnhanceProtectMode:
 		if e == varmortypes.Unknown {
-			return nil, fmt.Errorf("unknown enforcer")
+			return nil, nil, fmt.Errorf("unknown enforcer")
 		}
+
+		if policy.EnhanceProtect == nil {
+			return nil, nil, fmt.Errorf("the policy.enhanceProtect field cannot be nil")
+		}
+
+		profile.Mode = varmor.ProfileModeEnforce
+
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
-			profile.Content = apparmorprofile.GenerateEnhanceProtectProfile(&policy.EnhanceProtect, name)
+			profile.AppArmor = apparmorprofile.GenerateEnhanceProtectProfile(policy.EnhanceProtect, name)
 		}
 		// BPF
 		if (e & varmortypes.BPF) != 0 {
 			var bpfContent varmor.BpfContent
-			err = bpfprofile.GenerateEnhanceProtectProfile(&policy.EnhanceProtect, &bpfContent)
+			err = bpfprofile.GenerateEnhanceProtectProfile(kubeClient, policy.EnhanceProtect, &bpfContent, enableServiceEgressControl, enablePodEgressControl, &egressInfo)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			profile.BpfContent = &bpfContent
+			profile.Bpf = &bpfContent
 		}
 		// Seccomp
 		if (e & varmortypes.Seccomp) != 0 {
-			profile.SeccompContent, err = seccompprofile.GenerateEnhanceProtectProfile(&policy.EnhanceProtect, name)
+			profile.Seccomp, err = seccompprofile.GenerateEnhanceProtectProfile(policy.EnhanceProtect, name)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 
-	case varmortypes.BehaviorModelingMode:
+	case varmor.BehaviorModelingMode:
 		if e == varmortypes.Unknown {
-			return nil, fmt.Errorf("unknown enforcer")
+			return nil, nil, fmt.Errorf("unknown enforcer")
 		}
+
 		// BPF
 		if (e & varmortypes.BPF) != 0 {
-			return nil, fmt.Errorf("fatal error: not supported by the enforcer")
+			var bpfContent varmor.BpfContent
+			if complete {
+				// Create profile based on the AlwaysAllow template after the behvior modeling was completed.
+				profile.Mode = varmor.ProfileModeEnforce
+				profile.Bpf = &bpfContent
+			} else {
+				profile.Mode = varmor.ProfileModeComplain
+				profile.Bpf = &bpfContent
+			}
 		}
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
 			if complete {
 				// Create profile based on the AlwaysAllow template after the behvior modeling was completed.
-				profile.Content = apparmorprofile.GenerateAlwaysAllowProfile(name)
+				profile.Mode = varmor.ProfileModeEnforce
+				profile.AppArmor = apparmorprofile.GenerateAlwaysAllowProfile(name)
 			} else {
-				profile.Mode = "complain"
-				profile.Content = apparmorprofile.GenerateBehaviorModelingProfile(name)
+				profile.Mode = varmor.ProfileModeComplain
+				profile.AppArmor = apparmorprofile.GenerateBehaviorModelingProfile(name)
 			}
 		}
 		// Seccomp
 		if (e & varmortypes.Seccomp) != 0 {
-			profile.Mode = "complain"
-			profile.SeccompContent = seccompprofile.GenerateBehaviorModelingProfile()
+			if complete {
+				// Create profile based on the AlwaysAllow template after the behvior modeling was completed.
+				profile.Mode = varmor.ProfileModeEnforce
+				profile.Seccomp = seccompprofile.GenerateAlwaysAllowProfile()
+			} else {
+				profile.Mode = varmor.ProfileModeComplain
+				profile.Seccomp = seccompprofile.GenerateBehaviorModelingProfile()
+			}
 		}
 
-	case varmortypes.DefenseInDepthMode:
+	case varmor.DefenseInDepthMode:
 		if e == varmortypes.Unknown {
-			return nil, fmt.Errorf("unknown enforcer")
+			return nil, nil, fmt.Errorf("unknown enforcer")
 		}
+
+		if policy.DefenseInDepth == nil {
+			return nil, nil, fmt.Errorf("the policy.defenseInDepth field cannot be nil")
+		}
+
+		if policy.DefenseInDepth.AllowViolations {
+			profile.Mode = varmor.ProfileModeComplain
+		} else {
+			profile.Mode = varmor.ProfileModeEnforce
+		}
+
 		// BPF
 		if (e & varmortypes.BPF) != 0 {
-			return nil, fmt.Errorf("fatal error: not supported by the enforcer")
+			return nil, nil, fmt.Errorf("not supported by the BPF enforcer for now")
 		}
 		// AppArmor
 		if (e & varmortypes.AppArmor) != 0 {
-			apm, err := varmorInterface.ArmorProfileModels(namespace).Get(context.Background(), name, metav1.GetOptions{})
-			if err == nil && apm.Data.Profile.Content != "" {
-				profile.Content = apm.Data.Profile.Content
-			} else {
-				return nil, fmt.Errorf("fatal error: no existing AppArmor model found")
+			if policy.DefenseInDepth.AppArmor == nil {
+				return nil, nil, fmt.Errorf("the policy.defenseInDepth.appArmor field cannot be nil")
+			}
+
+			switch policy.DefenseInDepth.AppArmor.ProfileType {
+			case varmor.ProfileTypeBehaviorModel:
+				apm, err := varmorapm.RetrieveArmorProfileModel(varmorInterface, namespace, name, false, logger)
+				if err != nil || apm.Data.Profile.AppArmor == "" {
+					return nil, nil, fmt.Errorf("failed to retrieve the AppArmor profile from the ArmorProfileModel object (%s/%s)", namespace, name)
+				}
+				profile.AppArmor = apparmorprofile.GenerateDefenseInDepthProfile(
+					policy.DefenseInDepth.AppArmor.AppArmorRawRules,
+					apm.Data.Profile.AppArmor,
+					name)
+
+			case varmor.ProfileTypeCustom:
+				if policy.DefenseInDepth.AppArmor.CustomProfile == "" {
+					return nil, nil, fmt.Errorf("the policy.defenseInDepth.appArmor.customProfile field cannot be empty")
+				}
+				profile.AppArmor = apparmorprofile.GenerateDefenseInDepthProfile(
+					policy.DefenseInDepth.AppArmor.AppArmorRawRules,
+					policy.DefenseInDepth.AppArmor.CustomProfile,
+					name)
 			}
 		}
 		// Seccomp
 		if (e & varmortypes.Seccomp) != 0 {
-			apm, err := varmorInterface.ArmorProfileModels(namespace).Get(context.Background(), name, metav1.GetOptions{})
-			if err == nil && apm.Data.Profile.SeccompContent != "" {
-				profile.SeccompContent = apm.Data.Profile.SeccompContent
-			} else {
-				return nil, fmt.Errorf("fatal error: no existing Seccomp model found")
+			if policy.DefenseInDepth.Seccomp == nil {
+				return nil, nil, fmt.Errorf("the policy.defenseInDepth.seccomp field cannot be nil")
+			}
+
+			switch policy.DefenseInDepth.Seccomp.ProfileType {
+			case varmor.ProfileTypeBehaviorModel:
+				apm, err := varmorapm.RetrieveArmorProfileModel(varmorInterface, namespace, name, false, logger)
+				if err != nil || apm.Data.Profile.Seccomp == "" {
+					return nil, nil, fmt.Errorf("failed to retrieve Seccomp profile from the ArmorProfileModel object (%s/%s). error: %w", namespace, name, err)
+				}
+				profile.Seccomp, err = seccompprofile.GenerateDefenseInDepthProfile(policy.DefenseInDepth, apm.Data.Profile.Seccomp)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to parse the Seccomp profile from the ArmorProfileModel object (%s/%s). error: %w", namespace, name, err)
+				}
+			case varmor.ProfileTypeCustom:
+				if policy.DefenseInDepth.Seccomp.CustomProfile == "" {
+					return nil, nil, fmt.Errorf("the policy.defenseInDepth.seccomp.customProfile field cannot be empty")
+				}
+				profile.Seccomp, err = seccompprofile.GenerateDefenseInDepthProfile(
+					policy.DefenseInDepth,
+					policy.DefenseInDepth.Seccomp.CustomProfile)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to parse the custom Seccomp profile from the policy.defenseInDepth.seccomp.customProfile field. error: %w", err)
+				}
 			}
 		}
 
 	default:
-		return nil, fmt.Errorf("unknown mode")
+		return nil, nil, fmt.Errorf("unknown mode")
 	}
 
-	return &profile, nil
+	return &profile, &egressInfo, nil
 }
 
-func NewArmorProfile(obj interface{}, varmorInterface varmorinterface.CrdV1beta1Interface, clusterScope bool) (*varmor.ArmorProfile, error) {
-	ap := varmor.ArmorProfile{}
+func NewArmorProfile(
+	kubeClient *kubernetes.Clientset,
+	varmorInterface varmorinterface.CrdV1beta1Interface,
+	obj interface{},
+	clusterScope bool,
+	enableServiceEgressControl bool,
+	enablePodEgressControl bool,
+	logger logr.Logger) (*varmor.ArmorProfile, *varmortypes.EgressInfo, error) {
+
+	var ap varmor.ArmorProfile
+	var profile *varmor.Profile
+	var egressInfo *varmortypes.EgressInfo
+	var err error
+
 	controller := true
 
 	if clusterScope {
@@ -210,22 +312,21 @@ func NewArmorProfile(obj interface{}, varmorInterface varmorinterface.CrdV1beta1
 		}
 		ap.Finalizers = []string{"varmor.org/ap-protection"}
 
-		profile, err := GenerateProfile(vcp.Spec.Policy, ap.Name, ap.Namespace, varmorInterface, false)
+		profile, egressInfo, err = GenerateProfile(kubeClient, varmorInterface, vcp.Spec.Policy, ap.Name, ap.Namespace, false, enableServiceEgressControl, enablePodEgressControl, logger)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		ap.Spec.Profile = *profile
 		ap.Spec.Target = *vcp.Spec.Target.DeepCopy()
 		ap.Spec.UpdateExistingWorkloads = vcp.Spec.UpdateExistingWorkloads
 
-		if vcp.Spec.Policy.Mode == varmortypes.BehaviorModelingMode {
-			if vcp.Spec.Policy.ModelingOptions.Duration == 0 {
-				return &ap, fmt.Errorf("invalid parameter: .Spec.Policy.ModelingOptions.Duration == 0")
+		if vcp.Spec.Policy.Mode == varmor.BehaviorModelingMode {
+			if vcp.Spec.Policy.ModelingOptions == nil || vcp.Spec.Policy.ModelingOptions.Duration == 0 {
+				return nil, nil, fmt.Errorf("invalid parameter: the Spec.Policy.ModelingOptions.Duration field cannot be empty or 0")
 			}
 			ap.Spec.BehaviorModeling.Enable = true
 			ap.Spec.BehaviorModeling.Duration = vcp.Spec.Policy.ModelingOptions.Duration
 		}
-
 	} else {
 		vp := obj.(*varmor.VarmorPolicy)
 
@@ -243,22 +344,22 @@ func NewArmorProfile(obj interface{}, varmorInterface varmorinterface.CrdV1beta1
 		}
 		ap.Finalizers = []string{"varmor.org/ap-protection"}
 
-		profile, err := GenerateProfile(vp.Spec.Policy, ap.Name, ap.Namespace, varmorInterface, false)
+		profile, egressInfo, err = GenerateProfile(kubeClient, varmorInterface, vp.Spec.Policy, ap.Name, ap.Namespace, false, enableServiceEgressControl, enablePodEgressControl, logger)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		ap.Spec.Profile = *profile
 		ap.Spec.Target = *vp.Spec.Target.DeepCopy()
 		ap.Spec.UpdateExistingWorkloads = vp.Spec.UpdateExistingWorkloads
 
-		if vp.Spec.Policy.Mode == varmortypes.BehaviorModelingMode {
-			if vp.Spec.Policy.ModelingOptions.Duration == 0 {
-				return &ap, fmt.Errorf("invalid parameter: .Spec.Policy.ModelingOptions.Duration == 0")
+		if vp.Spec.Policy.Mode == varmor.BehaviorModelingMode {
+			if vp.Spec.Policy.ModelingOptions == nil || vp.Spec.Policy.ModelingOptions.Duration == 0 {
+				return nil, nil, fmt.Errorf("invalid parameter: the Spec.Policy.ModelingOptions.Duration field cannot be empty or 0")
 			}
 			ap.Spec.BehaviorModeling.Enable = true
 			ap.Spec.BehaviorModeling.Duration = vp.Spec.Policy.ModelingOptions.Duration
 		}
 	}
 
-	return &ap, nil
+	return &ap, egressInfo, nil
 }

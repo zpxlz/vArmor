@@ -1,0 +1,511 @@
+// Copyright 2025 vArmor Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package policy
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+
+	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
+	varmorconfig "github.com/bytedance/vArmor/internal/config"
+	varmorprofile "github.com/bytedance/vArmor/internal/profile"
+	varmortypes "github.com/bytedance/vArmor/internal/types"
+)
+
+// ValidateAddPolicy validates policy objects for creation operations.
+// This is a generic validation function that supports both VarmorPolicy and VarmorClusterPolicy types.
+// It performs comprehensive validation checks including target specification, policy mode requirements,
+// and naming constraints to ensure the policy can be safely created and processed by the controller.
+//
+// Parameters:
+//   - policy: The policy object to validate (can be *varmor.VarmorPolicy or *varmor.VarmorClusterPolicy)
+//   - behaviorModelingEnabled: Flag indicating if the behavior modeling feature of vArmor is enabled
+//
+// Returns:
+//   - bool: true if validation passes, false otherwise
+//   - string: Detailed error message if validation fails, empty string if validation passes
+func ValidateAddPolicy(policy interface{}, behaviorModelingEnabled bool) (bool, string) {
+	var spec varmor.VarmorPolicySpec
+	var namespace, name string
+	var clusterScope bool
+	var enforcers varmortypes.Enforcer
+
+	switch p := policy.(type) {
+	case *varmor.VarmorPolicy:
+		spec = p.Spec
+		namespace = p.Namespace
+		name = p.Name
+		enforcers = varmortypes.GetEnforcerType(p.Spec.Policy.Enforcer)
+	case *varmor.VarmorClusterPolicy:
+		spec = p.Spec
+		namespace = varmorconfig.Namespace
+		name = p.Name
+		enforcers = varmortypes.GetEnforcerType(p.Spec.Policy.Enforcer)
+		clusterScope = true
+	default:
+		return false, "The policy type is not supported."
+	}
+
+	// Validate target workload kind - only supported Kubernetes resource types are allowed
+	if spec.Target.Kind != "Deployment" && spec.Target.Kind != "StatefulSet" && spec.Target.Kind != "DaemonSet" && spec.Target.Kind != "Pod" {
+		return false, "The target kind is not supported. You should specify the target kind as a Deployment, StatefulSet, DaemonSet, or Pod."
+	}
+
+	// Ensure either target name or selector is specified, but not both
+	if spec.Target.Name == "" && spec.Target.Selector == nil {
+		return false, "The target name and selector are empty. You should specify the target workload either by name or selector."
+	}
+
+	// Target name and selector are mutually exclusive to avoid ambiguity
+	if spec.Target.Name != "" && spec.Target.Selector != nil {
+		return false, "The target name and selector are exclusive. You shouldn't specify the target workload using both name and selector."
+	}
+
+	// EnhanceProtect mode requires specific configuration to function properly
+	if spec.Policy.Mode == varmor.EnhanceProtectMode && spec.Policy.EnhanceProtect == nil {
+		return false, "The enhanceProtect field should be set when the policy runs in the EnhanceProtect mode."
+	}
+
+	// BehaviorModeling mode requires the feature to be enabled in the system
+	if !behaviorModelingEnabled && spec.Policy.Mode == varmor.BehaviorModelingMode {
+		return false, "The BehaviorModeling feature of vArmor is not enabled. Please enable it first."
+	}
+
+	// BehaviorModeling mode requires modeling options configuration
+	if behaviorModelingEnabled && spec.Policy.Mode == varmor.BehaviorModelingMode && spec.Policy.ModelingOptions == nil {
+		return false, "The modelingOptions field should be set when the policy runs in the BehaviorModeling mode."
+	}
+
+	// BehaviorModeling mode is not supported when NetworkProxy enforcer is activated.
+	if behaviorModelingEnabled && spec.Policy.Mode == varmor.BehaviorModelingMode && enforcers&varmortypes.NetworkProxy != 0 {
+		return false, "The BehaviorModeling mode is not supported when NetworkProxy enforcer is activated."
+	}
+
+	// DefenseInDepth mode requires specific configuration to function properly
+	if spec.Policy.Mode == varmor.DefenseInDepthMode && spec.Policy.DefenseInDepth == nil {
+		return false, "The defenseInDepth field should be set when the policy runs in the DefenseInDepth mode."
+	}
+
+	// DefenseInDepth mode is not supported when BPF enforcer is activated.
+	if spec.Policy.Mode == varmor.DefenseInDepthMode && enforcers&varmortypes.BPF != 0 {
+		return false, "The DefenseInDepth mode is not supported when BPF enforcer is activated."
+	}
+
+	// Validate MITMConfig
+	if spec.Policy.NetworkProxyConfig != nil && spec.Policy.NetworkProxyConfig.MITM != nil {
+		if ok, msg := validateMITMConfig(spec.Policy.NetworkProxyConfig.MITM); !ok {
+			return false, msg
+		}
+	}
+
+	// Validate Resources
+	if spec.Policy.NetworkProxyConfig != nil {
+		if ok, msg := validateProxyResources(spec.Policy.NetworkProxyConfig.Resources); !ok {
+			return false, msg
+		}
+		if spec.Policy.NetworkProxyConfig.ProxyPort != nil &&
+			spec.Policy.NetworkProxyConfig.ProxyAdminPort != nil &&
+			*spec.Policy.NetworkProxyConfig.ProxyPort == *spec.Policy.NetworkProxyConfig.ProxyAdminPort {
+			return false, "proxyPort and proxyAdminPort must be different"
+		}
+	}
+
+	if ok, msg := validateNetworkProxyEgressForSpec(&spec); !ok {
+		return false, msg
+	}
+
+	// Do not exceed the length of a standard Kubernetes name (63 characters)
+	// Note: The advisory length of AppArmor profile name is 100 (See https://bugs.launchpad.net/apparmor/+bug/1499544).
+	profileName := varmorprofile.GenerateArmorProfileName(namespace, name, clusterScope)
+	if len(profileName) > 63 {
+		if clusterScope {
+			return false, fmt.Sprintf("The length of policy object name is too long, please limit it to %d bytes.", 63-len(varmorprofile.ClusterProfileNameTemplate)+4-len(namespace))
+		} else {
+			return false, fmt.Sprintf("The length of policy object name is too long, please limit it to %d bytes.", 63-len(varmorprofile.ProfileNameTemplate)+4-len(namespace))
+		}
+	}
+
+	// All validations passed
+	return true, ""
+}
+
+// ValidateUpdatePolicy validates policy objects for update operations.
+// This is a generic validation function that supports both VarmorPolicy and VarmorClusterPolicy types.
+// It performs comprehensive validation checks to ensure policy updates maintain consistency
+// and do not violate system constraints, particularly for in-progress operations like behavior modeling.
+//
+// Parameters:
+//   - policy: The updated policy object to validate (can be *varmor.VarmorPolicy or *varmor.VarmorClusterPolicy)
+//   - oldEnforcer: The previous enforcer configuration from the existing policy
+//   - oldTarget: The previous target configuration from the existing policy
+//   - oldProxyConfig: The previous NetworkProxyConfig (nil to skip immutability checks on ProxyUID/Port/AdminPort)
+//
+// Returns:
+//   - bool: true if validation passes, false otherwise
+//   - string: Detailed error message if validation fails, empty string if validation passes
+func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varmor.Target, oldProxyConfig *varmor.NetworkProxyConfig) (bool, string) {
+	// Extract common policy specification fields from different policy types
+	var newEnforcers varmortypes.Enforcer
+	var newSpec varmor.VarmorPolicySpec
+	var newStatus varmor.VarmorPolicyStatus
+
+	switch p := policy.(type) {
+	case *varmor.VarmorPolicy:
+		newEnforcers = varmortypes.GetEnforcerType(p.Spec.Policy.Enforcer)
+		newSpec = p.Spec
+		newStatus = p.Status
+	case *varmor.VarmorClusterPolicy:
+		newEnforcers = varmortypes.GetEnforcerType(p.Spec.Policy.Enforcer)
+		newSpec = p.Spec
+		newStatus = p.Status
+	default:
+		return false, "The policy type is not supported."
+	}
+
+	oldEnforcers := varmortypes.GetEnforcerType(oldEnforcer)
+
+	// Disallow modifying the target field of a policy.
+	// Target modifications require policy recreation to ensure proper workload association and security consistency
+	if !reflect.DeepEqual(newSpec.Target, oldTarget) {
+		return false, "Modifying the target field of a policy is not allowed. You need to recreate the policy object."
+	}
+
+	// Disallow modifying immutable proxy config fields (ProxyUID, ProxyPort, ProxyAdminPort).
+	// These values are baked into each Pod's iptables rules at init time and cannot be
+	// hot-reloaded. Changing them would cause a mismatch between the iptables REDIRECT
+	// target and the Envoy listener port in existing Pods.
+	// When oldProxyConfig is nil (controller path), this check is skipped.
+	if oldProxyConfig != nil {
+		if !proxyConfigImmutableFieldsEqual(oldProxyConfig, newSpec.Policy.NetworkProxyConfig) {
+			return false, "Modifying proxyUID, proxyPort, or proxyAdminPort is not allowed after the policy is created. You need to recreate the policy object."
+		}
+	}
+
+	// Disallow switching the mode of a policy from BehaviorModeling to others when behavior modeling is still incomplete.
+	// This prevents interrupting ongoing behavior modeling processes and ensures data consistency
+	if newSpec.Policy.Mode != varmor.BehaviorModelingMode && newStatus.Phase == varmor.VarmorPolicyModeling {
+		return false, "Switching the mode of a policy from BehaviorModeling to others is not allowed when behavior modeling is still incomplete."
+	}
+
+	// Disallow modifying the enforcer field of a policy when behavior modeling is still incomplete.
+	// Enforcer changes during modeling could invalidate collected behavior data and modeling results
+	if newSpec.Policy.Mode == varmor.BehaviorModelingMode &&
+		newStatus.Phase == varmor.VarmorPolicyModeling &&
+		newEnforcers != oldEnforcers {
+		return false, "Modifying the enforcer field of a policy is not allowed when behavior modeling is still incomplete."
+	}
+
+	// Disallow removing the activated AppArmor or Seccomp enforcer.
+	if (newEnforcers&oldEnforcers != oldEnforcers) && (newEnforcers|varmortypes.BPF != oldEnforcers) {
+		return false, "Modifying a policy to remove the AppArmor or Seccomp enforcer is not allowed. To remove them, you need to recreate the policy object."
+	}
+
+	// Make sure the enhanceProtect field has been set when the policy runs in the EnhanceProtect mode.
+	// EnhanceProtect mode requires specific configuration to function properly and provide enhanced protection
+	if newSpec.Policy.Mode == varmor.EnhanceProtectMode && newSpec.Policy.EnhanceProtect == nil {
+		return false, "The enhanceProtect field should be set when the policy runs in the EnhanceProtect mode."
+	}
+
+	// Make sure the modelingOptions field has been set when the policy runs in BehaviorModeling mode.
+	// Behavior modeling requires configuration options to guide the modeling process and define modeling parameters
+	if newSpec.Policy.Mode == varmor.BehaviorModelingMode && newSpec.Policy.ModelingOptions == nil {
+		return false, "The modelingOptions field should be set when the policy runs in the BehaviorModeling mode."
+	}
+
+	// Disallow switching the BehaviorModeling mode when NetworkProxy enforcer is activated.
+	if newSpec.Policy.Mode == varmor.BehaviorModelingMode && newEnforcers&varmortypes.NetworkProxy != 0 {
+		return false, "Modifying the policy to switch to BehaviorModeling mode is not allowed when NetworkProxy enforcer is activated."
+	}
+
+	// Make sure the defenseInDepth field has been set when the policy runs in DefenseInDepth mode.
+	// DefenseInDepth mode requires specific configuration to function properly and provide defense-in-depth protection
+	if newSpec.Policy.Mode == varmor.DefenseInDepthMode && newSpec.Policy.DefenseInDepth == nil {
+		return false, "The defenseInDepth field should be set when the policy runs in the DefenseInDepth mode."
+	}
+
+	// DefenseInDepth mode is not supported when BPF enforcer is activated.
+	if newSpec.Policy.Mode == varmor.DefenseInDepthMode && newEnforcers&varmortypes.BPF != 0 {
+		return false, "The DefenseInDepth mode is not supported when BPF enforcer is activated."
+	}
+
+	// Validate MITMConfig
+	if newSpec.Policy.NetworkProxyConfig != nil && newSpec.Policy.NetworkProxyConfig.MITM != nil {
+		if ok, msg := validateMITMConfig(newSpec.Policy.NetworkProxyConfig.MITM); !ok {
+			return false, msg
+		}
+	}
+
+	// Validate Resources
+	if newSpec.Policy.NetworkProxyConfig != nil {
+		if ok, msg := validateProxyResources(newSpec.Policy.NetworkProxyConfig.Resources); !ok {
+			return false, msg
+		}
+		if newSpec.Policy.NetworkProxyConfig.ProxyPort != nil &&
+			newSpec.Policy.NetworkProxyConfig.ProxyAdminPort != nil &&
+			*newSpec.Policy.NetworkProxyConfig.ProxyPort == *newSpec.Policy.NetworkProxyConfig.ProxyAdminPort {
+			return false, "proxyPort and proxyAdminPort must be different"
+		}
+	}
+
+	if ok, msg := validateNetworkProxyEgressForSpec(&newSpec); !ok {
+		return false, msg
+	}
+
+	// All validations passed
+	return true, ""
+}
+
+// proxyConfigImmutableFieldsEqual compares the effective immutable fields of
+// two NetworkProxyConfig values after applying their runtime defaults.
+func proxyConfigImmutableFieldsEqual(old, new *varmor.NetworkProxyConfig) bool {
+	oldProxyUID, oldProxyPort, oldProxyAdminPort := normalizedProxyConfigImmutableFields(old)
+	newProxyUID, newProxyPort, newProxyAdminPort := normalizedProxyConfigImmutableFields(new)
+
+	return oldProxyUID == newProxyUID &&
+		oldProxyPort == newProxyPort &&
+		oldProxyAdminPort == newProxyAdminPort
+}
+
+func normalizedProxyConfigImmutableFields(config *varmor.NetworkProxyConfig) (int64, uint16, uint16) {
+	proxyUID := varmorconfig.DefaultProxyUID
+	proxyPort := varmorconfig.DefaultProxyPort
+	proxyAdminPort := varmorconfig.DefaultProxyAdminPort
+	if config != nil {
+		if config.ProxyUID != nil {
+			proxyUID = *config.ProxyUID
+		}
+		if config.ProxyPort != nil {
+			proxyPort = *config.ProxyPort
+		}
+		if config.ProxyAdminPort != nil {
+			proxyAdminPort = *config.ProxyAdminPort
+		}
+	}
+
+	return proxyUID, proxyPort, proxyAdminPort
+}
+
+// validateNetworkProxyEgressForSpec validates NetworkProxy egress rules
+// for both EnhanceProtect and DefenseInDepth paths.
+func validateNetworkProxyEgressForSpec(spec *varmor.VarmorPolicySpec) (bool, string) {
+	if spec.Policy.EnhanceProtect != nil &&
+		spec.Policy.EnhanceProtect.NetworkProxyRawRules != nil &&
+		spec.Policy.EnhanceProtect.NetworkProxyRawRules.Egress != nil {
+		if ok, msg := ValidateNetworkProxyEgress(spec.Policy.EnhanceProtect.NetworkProxyRawRules.Egress); !ok {
+			return false, msg
+		}
+	}
+	if spec.Policy.DefenseInDepth != nil &&
+		spec.Policy.DefenseInDepth.NetworkProxy != nil &&
+		spec.Policy.DefenseInDepth.NetworkProxy.Egress != nil {
+		if ok, msg := ValidateNetworkProxyEgress(spec.Policy.DefenseInDepth.NetworkProxy.Egress); !ok {
+			return false, msg
+		}
+	}
+	return true, ""
+}
+
+// containsYAMLUnsafeChars reports whether s contains any character that is
+// illegal in network identifiers (domains, header names, HTTP paths, IPs)
+// and could cause YAML injection if interpolated into a double-quoted scalar.
+//
+// NOTE: This must stay in sync with needsYAMLEscape in
+// internal/networkproxy/profile/yaml_escape.go so that the webhook rejects
+// exactly the same characters the renderer would escape.
+func containsYAMLUnsafeChars(s string) bool {
+	for _, c := range s {
+		if c < 0x20 || c == 0x7F || c == '\\' || c == '"' ||
+			c == 0x85 || c == 0x2028 || c == 0x2029 {
+			return true
+		}
+	}
+	return false
+}
+
+// validateNoYAMLUnsafeChars checks whether value contains YAML-unsafe characters
+// and returns a formatted error message if it does.
+func validateNoYAMLUnsafeChars(field string, value string) (bool, string) {
+	if containsYAMLUnsafeChars(value) {
+		return false, fmt.Sprintf("%s %q contains control characters or YAML-unsafe characters", field, value)
+	}
+	return true, ""
+}
+
+func validateMITMConfig(mitm *varmor.MITMConfig) (bool, string) {
+	if len(mitm.Domains) == 0 {
+		return false, "mitm.domains must contain at least one domain"
+	}
+
+	domainSet := make(map[string]bool, len(mitm.Domains))
+	for i, d := range mitm.Domains {
+		if ok, msg := validateNoYAMLUnsafeChars(fmt.Sprintf("mitm.domains[%d]", i), d); !ok {
+			return false, msg
+		}
+		domainSet[d] = true
+	}
+
+	for i, hm := range mitm.HeaderMutations {
+		if !domainSet[hm.Domain] {
+			return false, fmt.Sprintf(
+				"mitm.headerMutations[%d].domain %q is not in mitm.domains",
+				i, hm.Domain)
+		}
+
+		if len(hm.Headers) == 0 {
+			return false, fmt.Sprintf(
+				"mitm.headerMutations[%d].headers must not be empty", i)
+		}
+
+		for j, h := range hm.Headers {
+			if h.Name == "" {
+				return false, fmt.Sprintf(
+					"mitm.headerMutations[%d].headers[%d].name must not be empty",
+					i, j)
+			}
+
+			field := fmt.Sprintf("mitm.headerMutations[%d].headers[%d].name", i, j)
+			if ok, msg := validateNoYAMLUnsafeChars(field, h.Name); !ok {
+				return false, msg
+			}
+
+			hasValue := h.Value != ""
+			hasSecretRef := h.SecretRef != nil
+
+			if !hasValue && !hasSecretRef {
+				return false, fmt.Sprintf(
+					"mitm.headerMutations[%d].headers[%d]: one of value or secretRef must be specified",
+					i, j)
+			}
+			if hasValue && hasSecretRef {
+				return false, fmt.Sprintf(
+					"mitm.headerMutations[%d].headers[%d]: value and secretRef are mutually exclusive",
+					i, j)
+			}
+
+			if hasSecretRef {
+				if h.SecretRef.Name == "" {
+					return false, fmt.Sprintf(
+						"mitm.headerMutations[%d].headers[%d].secretRef.name must not be empty",
+						i, j)
+				}
+				if h.SecretRef.Key == "" {
+					return false, fmt.Sprintf(
+						"mitm.headerMutations[%d].headers[%d].secretRef.key must not be empty",
+						i, j)
+				}
+			}
+		}
+	}
+
+	return true, ""
+}
+
+// validateProxyResources validates the ProxyResourceOverride configuration.
+// It ensures that when both requests and limits are specified for the same
+// resource type, limits are not less than requests.
+func validateProxyResources(override *varmor.ProxyResourceOverride) (bool, string) {
+	if override == nil {
+		return true, ""
+	}
+
+	if len(override.Requests) > 0 && len(override.Limits) > 0 {
+		for resourceName, requestVal := range override.Requests {
+			if limitVal, exists := override.Limits[resourceName]; exists {
+				if limitVal.Cmp(requestVal) < 0 {
+					return false, fmt.Sprintf(
+						"networkProxyConfig.resources: limits.%s (%s) must be >= requests.%s (%s)",
+						resourceName, limitVal.String(), resourceName, requestVal.String())
+				}
+			}
+		}
+	}
+
+	return true, ""
+}
+
+// ValidateNetworkProxyEgress validates string fields in NetworkProxyEgress
+// that will be interpolated into Envoy xDS YAML. This prevents YAML injection
+// attacks where malicious characters in user-supplied fields could break out
+// of YAML quoted scalars.
+//
+// This function is called from the webhook admission controller and provides
+// defense-in-depth alongside the renderer's yamlEscapeScalar function.
+func ValidateNetworkProxyEgress(egress *varmor.NetworkProxyEgress) (bool, string) {
+	if egress == nil {
+		return true, ""
+	}
+
+	// Validate defaultAction. Only "deny" and "allow" are legal. The downstream
+	// classifier treats any value other than "deny" as allow-default, so an
+	// unvalidated typo (e.g. "denny") would silently turn a deny-default
+	// (whitelist) policy into an allow-default (blacklist) one. Reject anything
+	// outside the legal set here. The comparison is case-insensitive to match
+	// the classifier's strings.EqualFold semantics.
+	if !strings.EqualFold(egress.DefaultAction, "deny") &&
+		!strings.EqualFold(egress.DefaultAction, "allow") {
+		return false, fmt.Sprintf(
+			"egress.defaultAction: %q is invalid, must be \"deny\" or \"allow\"",
+			egress.DefaultAction)
+	}
+
+	// Validate HTTP rules
+	for i, rule := range egress.HTTPRules {
+		for j, host := range rule.Match.Hosts {
+			field := fmt.Sprintf("httpRules[%d].match.hosts[%d]", i, j)
+			if ok, msg := validateNoYAMLUnsafeChars(field, host); !ok {
+				return false, msg
+			}
+		}
+		for j, path := range rule.Match.Paths {
+			if path.Exact != "" {
+				field := fmt.Sprintf("httpRules[%d].match.paths[%d].exact", i, j)
+				if ok, msg := validateNoYAMLUnsafeChars(field, path.Exact); !ok {
+					return false, msg
+				}
+			}
+			if path.Prefix != "" {
+				field := fmt.Sprintf("httpRules[%d].match.paths[%d].prefix", i, j)
+				if ok, msg := validateNoYAMLUnsafeChars(field, path.Prefix); !ok {
+					return false, msg
+				}
+			}
+		}
+		for j, method := range rule.Match.Methods {
+			field := fmt.Sprintf("httpRules[%d].match.methods[%d]", i, j)
+			if ok, msg := validateNoYAMLUnsafeChars(field, method); !ok {
+				return false, msg
+			}
+		}
+	}
+
+	// Validate L4 egress rules (IP/CIDR fields)
+	for i, rule := range egress.Rules {
+		if rule.IP != "" {
+			field := fmt.Sprintf("rules[%d].ip", i)
+			if ok, msg := validateNoYAMLUnsafeChars(field, rule.IP); !ok {
+				return false, msg
+			}
+		}
+		if rule.CIDR != "" {
+			field := fmt.Sprintf("rules[%d].cidr", i)
+			if ok, msg := validateNoYAMLUnsafeChars(field, rule.CIDR); !ok {
+				return false, msg
+			}
+		}
+	}
+
+	return true, ""
+}

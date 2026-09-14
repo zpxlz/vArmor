@@ -1,5 +1,5 @@
 ## Building AppArmor & libseccomp
-FROM debian:bookworm as apparmor-libseccomp-builder
+FROM debian:bookworm AS apparmor-libseccomp-builder
 
 LABEL maintainer="vArmor authors"
 
@@ -22,27 +22,31 @@ RUN echo "policy-features=/etc/apparmor.d/abi/varmor" >> /etc/apparmor/parser.co
 
 RUN git clone https://github.com/seccomp/libseccomp.git /libseccomp
 WORKDIR /libseccomp
-RUN git checkout v2.5.5
+RUN git checkout v2.6.0
 RUN ./autogen.sh && ./configure --prefix=/usr && \
     make && make install
 
 
 ## Building vArmor-ebpf
-FROM ghcr.io/cilium/ebpf-builder:1695900694 as vArmor-ebpf-builder
+FROM ghcr.io/cilium/ebpf-builder:1777990914 AS varmor-ebpf-builder
 
-RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 90
-RUN update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-17 90
+RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 90
+RUN update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-22 90
 ADD . /varmor
 WORKDIR /varmor
 RUN make build-ebpf
 
 
 ## Building vArmor
-FROM golang:1.22-bookworm as vArmor-builder
+FROM golang:1.25-bookworm AS varmor-builder
 
 LABEL maintainer="vArmor authors"
 
-ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+ARG GITVERSION
+ARG GITCOMMIT
+ARG BUILDDATE
 ADD . /varmor
 WORKDIR /varmor
 
@@ -50,17 +54,27 @@ COPY --from=apparmor-libseccomp-builder /usr/lib/libseccomp.* /usr/lib/
 COPY --from=apparmor-libseccomp-builder /usr/include/seccomp* /usr/include/
 COPY --from=apparmor-libseccomp-builder /usr/lib/libapparmor.* /usr/lib/
 COPY --from=apparmor-libseccomp-builder /usr/include/aalogparse /usr/include/aalogparse
-COPY --from=vArmor-ebpf-builder /varmor/vArmor-ebpf/pkg/tracer/bpf_bpfel.go /varmor/internal/behavior/tracer
-COPY --from=vArmor-ebpf-builder /varmor/vArmor-ebpf/pkg/tracer/bpf_bpfel.o /varmor/internal/behavior/tracer
-COPY --from=vArmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.go /varmor/pkg/lsm/bpfenforcer
-COPY --from=vArmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.o /varmor/pkg/lsm/bpfenforcer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/processtracer/bpf_bpfel.go /varmor/pkg/processtracer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/processtracer/bpf_bpfel.o /varmor/pkg/processtracer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.go /varmor/pkg/lsm/bpfenforcer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.o /varmor/pkg/lsm/bpfenforcer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpfloop_bpfel.go /varmor/pkg/lsm/bpfenforcer
+COPY --from=varmor-ebpf-builder /varmor/vArmor-ebpf/pkg/bpfenforcer/bpfloop_bpfel.o /varmor/pkg/lsm/bpfenforcer
 
 RUN apt-get update
 RUN apt-get install -y libseccomp2 libseccomp-dev
-RUN export GOOS=$(echo ${TARGETPLATFORM} | cut -d / -f1) && \
-    export GOARCH=$(echo ${TARGETPLATFORM} | cut -d / -f2)
-RUN go env
-RUN go build -o /output/vArmor -v ./cmd/varmor/
+RUN GOOS=${TARGETOS} && \
+    GOARCH=${TARGETARCH} && \
+    GOVERSION=$(go version | awk '{print $3}') && \
+    go build -o /output/vArmor -v \
+        -ldflags "-w -X 'k8s.io/client-go/pkg/version.gitVersion=${GITVERSION}' \
+                     -X 'k8s.io/client-go/pkg/version.gitCommit=${GITCOMMIT}'   \
+                     -X 'k8s.io/client-go/pkg/version.buildDate=${BUILDDATE}'  \
+                     -X 'main.gitVersion=${GITVERSION}' \
+                     -X 'main.gitCommit=${GITCOMMIT}' \
+                     -X 'main.buildDate=${BUILDDATE}' \
+                     -X 'main.goVersion=${GOVERSION}'" \
+        ./cmd/varmor/
 
 
 ## Packaging vArmor
@@ -71,9 +85,9 @@ LABEL maintainer="vArmor authors"
 ARG TARGETARCH
 
 # Copy the varmor executable to the image
-COPY --from=vArmor-builder /output/ /varmor
+COPY --from=varmor-builder /output/ /varmor
 # Copy the AppArmor feature ABI file which used during development and testing the VarmorPolicy to the image
-COPY --from=vArmor-builder /varmor/config/apparmor.d/abi/varmor /varmor/apparmor.d/abi/varmor
+COPY --from=varmor-builder /varmor/config/apparmor.d/abi/varmor /varmor/apparmor.d/abi/varmor
 # Copy the AppArmor executables and tools to the image
 COPY --from=apparmor-libseccomp-builder /etc/apparmor/parser.conf /etc/apparmor/parser.conf
 COPY --from=apparmor-libseccomp-builder /etc/apparmor.d /varmor/apparmor.d

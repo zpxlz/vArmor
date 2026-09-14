@@ -28,12 +28,27 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - secrets
+  verbs:
+  - get
+  - create
+  - delete
+  - update
+- apiGroups:
+  - ""
+  resources:
   - namespaces
   - nodes
   verbs:
   - get
   - list
   - watch
+{{- if .Values.serviceEgressControl.enabled }}
+  {{- toYaml .Values.manager.serviceEgressControl.clusterrules | nindent 0  }}
+{{- end }}
+{{- if .Values.podEgressControl.enabled }}
+  {{- toYaml .Values.manager.podEgressControl.clusterrules | nindent 0  }}
+{{- end }}
 - apiGroups:
   - crd.varmor.org
   resources:
@@ -42,6 +57,7 @@ rules:
   - get
   - list
   - watch
+  - deletecollection
 - apiGroups:
   - crd.varmor.org
   resources:
@@ -58,6 +74,7 @@ rules:
   - get
   - list
   - watch
+  - deletecollection
 - apiGroups:
   - crd.varmor.org
   resources:
@@ -96,6 +113,7 @@ rules:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
+  - validatingwebhookconfigurations
   verbs:
   - create
   - list
@@ -104,13 +122,21 @@ rules:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
+  - validatingwebhookconfigurations
   verbs:
   - delete
   resourceNames:
   - varmor-resource-mutating-webhook-cfg
+  - varmor-policy-validating-webhook-cfg
 - apiGroups:
   - authentication.k8s.io
   resources:
   - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
   verbs:
   - create

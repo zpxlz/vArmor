@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package bpfenforcer manages the BPF programs and interacts with them through the BPF maps
 package bpfenforcer
 
 import (
 	"fmt"
+	"net"
+	"os"
 	"reflect"
-	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/go-logr/logr"
@@ -33,38 +37,42 @@ import (
 type enforceID struct {
 	pid     uint32
 	mntNsID uint32
+	ips     []string
 }
 
 type bpfProfile struct {
+	mode           varmor.ProfileMode
 	bpfContent     varmor.BpfContent
 	containerCache map[string]enforceID // local cache <containerID: enforceID>
 }
 
 type BpfEnforcer struct {
-	TaskCreateCh     chan varmortypes.ContainerInfo
-	TaskDeleteCh     chan varmortypes.ContainerInfo
-	TaskDeleteSyncCh chan bool
-	objs             bpfObjects
-	capableLink      link.Link
-	openFileLink     link.Link
-	pathSymlinkLink  link.Link
-	pathLinkLink     link.Link
-	pathRenameLink   link.Link
-	bprmLink         link.Link
-	sockConnLink     link.Link
-	ptraceLink       link.Link
-	mountLink        link.Link
-	moveMountLink    link.Link
-	umountLink       link.Link
-	bpfProfileCache  map[string]bpfProfile // <profileName: bpfProfile>
-	containerCache   map[string]enforceID  // global cache <containerID: enforceID>
-	log              logr.Logger
+	TaskStartCh       chan varmortypes.ContainerInfo
+	TaskDeleteCh      chan varmortypes.ContainerInfo
+	TaskDeleteSyncCh  chan bool
+	objs              bpfObjects
+	capableLink       link.Link
+	openFileLink      link.Link
+	pathSymlinkLink   link.Link
+	pathLinkLink      link.Link
+	pathRenameLink    link.Link
+	bprmLink          link.Link
+	sockConnLink      link.Link
+	socketLink        link.Link
+	ptraceLink        link.Link
+	mountLink         link.Link
+	moveMountLink     link.Link
+	umountLink        link.Link
+	maxMountRuleCount uint32
+	bpfProfileCache   map[string]bpfProfile // <profileName: bpfProfile>
+	containerCache    map[string]enforceID  // global cache <containerID: enforceID>
+	log               logr.Logger
 }
 
-// NewBpfEnforcer create a BpfEnforcer, and initialize the BPF settings and resources
+// NewBpfEnforcer creates a BpfEnforcer, and initialize the BPF settings and resources
 func NewBpfEnforcer(log logr.Logger) (*BpfEnforcer, error) {
 	enforcer := BpfEnforcer{
-		TaskCreateCh:     make(chan varmortypes.ContainerInfo, 100),
+		TaskStartCh:      make(chan varmortypes.ContainerInfo, 100),
 		TaskDeleteCh:     make(chan varmortypes.ContainerInfo, 100),
 		TaskDeleteSyncCh: make(chan bool, 1),
 		objs:             bpfObjects{},
@@ -80,7 +88,7 @@ func NewBpfEnforcer(log logr.Logger) (*BpfEnforcer, error) {
 	return &enforcer, nil
 }
 
-// initBPF initialize the BPF settings and resources
+// initBPF initializes the BPF settings and resources
 func (enforcer *BpfEnforcer) initBPF() error {
 	// Allow the current process to lock memory for eBPF resources
 	enforcer.log.Info("remove memory lock")
@@ -91,9 +99,31 @@ func (enforcer *BpfEnforcer) initBPF() error {
 
 	// Parse the ebpf program
 	enforcer.log.Info("parses the ebpf program into a CollectionSpec")
-	collectionSpec, err := loadBpf()
+	var (
+		collectionSpec *ebpf.CollectionSpec
+		variant        string
+	)
+	// Detect bpf_loop helper availability (kernel >= 5.17).
+	// NOTE: cilium/ebpf v0.20 HaveProgramHelper does not set AttachType for
+	// LSM/Tracing program types, which makes the probe fail with EINVAL.
+	// Use Kprobe as the probe target since helper availability is kernel-wide.
+	if features.HaveProgramHelper(ebpf.Kprobe, asm.FnLoop) == nil {
+		collectionSpec, err = loadBpfLoop()
+		variant = "bpf_loop"
+	} else {
+		collectionSpec, err = loadBpf()
+		variant = "unrolled"
+	}
 	if err != nil {
 		return err
+	}
+	enforcer.log.Info("selected bpf variant", "variant", variant)
+
+	// Set mount rule count based on BPF variant
+	if variant == "bpf_loop" {
+		enforcer.maxMountRuleCount = MaxBpfMountRuleCountBpfLoop
+	} else {
+		enforcer.maxMountRuleCount = MaxBpfMountRuleCountUnrolled
 	}
 
 	// Create a mock inner map for the file rules
@@ -101,8 +131,8 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Name:       "v_file_inner_",
 		Type:       ebpf.Hash,
 		KeySize:    4,
-		ValueSize:  4*2 + uint32(varmortypes.MaxFilePathPatternLength)*2,
-		MaxEntries: uint32(varmortypes.MaxBpfFileRuleCount),
+		ValueSize:  PathRuleSize,
+		MaxEntries: MaxBpfFileRuleCount,
 	}
 	collectionSpec.Maps["v_file_outer"].InnerMap = &fileInnerMap
 
@@ -111,8 +141,8 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Name:       "v_bprm_inner_",
 		Type:       ebpf.Hash,
 		KeySize:    4,
-		ValueSize:  4*2 + uint32(varmortypes.MaxFilePathPatternLength)*2,
-		MaxEntries: uint32(varmortypes.MaxBpfBprmRuleCount),
+		ValueSize:  PathRuleSize,
+		MaxEntries: MaxBpfFileRuleCount,
 	}
 	collectionSpec.Maps["v_bprm_outer"].InnerMap = &bprmInnerMap
 
@@ -121,8 +151,8 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Name:       "v_net_inner_",
 		Type:       ebpf.Hash,
 		KeySize:    4,
-		ValueSize:  4*2 + 16*2,
-		MaxEntries: uint32(varmortypes.MaxBpfNetworkRuleCount),
+		ValueSize:  NetRuleSize,
+		MaxEntries: MaxBpfNetworkRuleCount,
 	}
 	collectionSpec.Maps["v_net_outer"].InnerMap = &netInnerMap
 
@@ -130,23 +160,28 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Name:       "v_mount_inner_",
 		Type:       ebpf.Hash,
 		KeySize:    4,
-		ValueSize:  4*3 + uint32(varmortypes.MaxFileSystemTypeLength) + uint32(varmortypes.MaxFilePathPatternLength)*2,
-		MaxEntries: uint32(varmortypes.MaxBpfMountRuleCount),
+		ValueSize:  MountRuleSize,
+		MaxEntries: enforcer.maxMountRuleCount,
 	}
 	collectionSpec.Maps["v_mount_outer"].InnerMap = &mountInnerMap
 
 	// Set the mnt ns id to the BPF program
-	initMntNsId, err := varmorutils.ReadMntNsID(1)
+	initMntNsID, err := varmorutils.ReadMntNsID(1)
 	if err != nil {
 		return err
 	}
-	collectionSpec.RewriteConstants(map[string]interface{}{
-		"init_mnt_ns": initMntNsId,
-	})
+	collectionSpec.Variables["init_mnt_ns"].Set(initMntNsID)
 
 	// Load pre-compiled programs and maps into the kernel.
+	if err := os.MkdirAll(PinPath, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create bpf fs subpath: %+v", err)
+	}
 	enforcer.log.Info("load ebpf program and maps into the kernel")
-	err = collectionSpec.LoadAndAssign(&enforcer.objs, nil)
+	err = collectionSpec.LoadAndAssign(&enforcer.objs, &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: PinPath,
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -157,7 +192,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorCapable,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorCapable) failed: %v", err)
 	}
 	enforcer.capableLink = capableLink
 
@@ -166,7 +201,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorFileOpen,
 	})
 	if err != nil {
-		return fmt.Errorf("link.AttachLSM() failed: %v", err)
+		return fmt.Errorf("link.AttachLSM(VarmorFileOpen) failed: %v", err)
 	}
 	enforcer.openFileLink = openFileLink
 
@@ -175,7 +210,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorPathSymlink,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorPathSymlink) failed: %v", err)
 	}
 	enforcer.pathSymlinkLink = pathSymlinkLink
 
@@ -184,7 +219,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorPathLink,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorPathLink) failed: %v", err)
 	}
 	enforcer.pathLinkLink = pathLinkLink
 
@@ -193,7 +228,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorPathRename,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorPathRename) failed: %v", err)
 	}
 	enforcer.pathRenameLink = pathRenameLink
 
@@ -202,16 +237,25 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorBprmCheckSecurity,
 	})
 	if err != nil {
-		return fmt.Errorf("link.AttachLSM() failed: %v", err)
+		return fmt.Errorf("link.AttachLSM(VarmorBprmCheckSecurity) failed: %v", err)
 	}
 	enforcer.bprmLink = bprmLink
+
+	enforcer.log.Info("attach VarmorSocketCreate to the LSM hook point")
+	socketLink, err := link.AttachLSM(link.LSMOptions{
+		Program: enforcer.objs.VarmorSocketCreate,
+	})
+	if err != nil {
+		return fmt.Errorf("link.AttachLSM(VarmorSocketCreate) failed: %v", err)
+	}
+	enforcer.socketLink = socketLink
 
 	enforcer.log.Info("attach VarmorSocketConnect to the LSM hook point")
 	sockConnLink, err := link.AttachLSM(link.LSMOptions{
 		Program: enforcer.objs.VarmorSocketConnect,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorSocketConnect) failed: %v", err)
 	}
 	enforcer.sockConnLink = sockConnLink
 
@@ -220,7 +264,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorPtraceAccessCheck,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorPtraceAccessCheck) failed: %v", err)
 	}
 	enforcer.ptraceLink = ptraceLink
 
@@ -229,7 +273,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorMount,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("link.AttachLSM(VarmorMount) failed: %v", err)
 	}
 	enforcer.mountLink = mountLink
 
@@ -238,7 +282,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorMoveMount,
 	})
 	if err != nil {
-		return nil
+		return fmt.Errorf("link.AttachLSM(VarmorMoveMount) failed: %v", err)
 	}
 	enforcer.moveMountLink = moveMountLink
 
@@ -247,7 +291,7 @@ func (enforcer *BpfEnforcer) initBPF() error {
 		Program: enforcer.objs.VarmorUmount,
 	})
 	if err != nil {
-		return nil
+		return fmt.Errorf("link.AttachLSM(VarmorUmount) failed: %v", err)
 	}
 	enforcer.umountLink = umountLink
 
@@ -264,24 +308,53 @@ func (enforcer *BpfEnforcer) Close() {
 	enforcer.pathRenameLink.Close()
 	enforcer.bprmLink.Close()
 	enforcer.sockConnLink.Close()
+	enforcer.socketLink.Close()
 	enforcer.ptraceLink.Close()
 	enforcer.mountLink.Close()
 	enforcer.moveMountLink.Close()
 	enforcer.umountLink.Close()
+	enforcer.objs.V_auditRb.Unpin()
+	os.RemoveAll(PinPath)
 	enforcer.objs.Close()
+}
+
+func (enforcer *BpfEnforcer) setPodIps(mntNsID uint32, addresses []string) error {
+	if len(addresses) > 2 {
+		return fmt.Errorf("pods may be allocated at most 1 value for each of IPv4 and IPv6")
+	}
+
+	var podIP bpfPodIp
+	for _, address := range addresses {
+		ip := net.ParseIP(address)
+		if ip == nil {
+			return fmt.Errorf("the address is not a valid textual representation of an IP address")
+		}
+		if ip.To4() != nil {
+			podIP.Flags |= Ipv4Match
+			copy(podIP.Ipv4[:], ip.To4())
+		} else {
+			podIP.Flags |= Ipv6Match
+			copy(podIP.Ipv6[:], ip.To16())
+		}
+	}
+	return enforcer.objs.V_podIp.Put(&mntNsID, podIP)
+}
+
+func (enforcer *BpfEnforcer) removePodIps(mntNsID uint32) error {
+	return enforcer.objs.V_podIp.Delete(&mntNsID)
 }
 
 func (enforcer *BpfEnforcer) eventHandler(stopCh <-chan struct{}) {
 	logger := enforcer.log.WithName("eventHandler()")
-	logger.Info("start handle the containerd events")
+	logger.Info("start handling the containerd events")
 
 	for {
 		select {
-		case info := <-enforcer.TaskCreateCh:
+		case info := <-enforcer.TaskStartCh:
+			// Handle the creation event of target container
 			key := fmt.Sprintf("container.bpf.security.beta.varmor.org/%s", info.ContainerName)
-			value := info.PodAnnotations[key]
-
-			if !strings.HasPrefix(value, "localhost/") {
+			value, ok := info.PodAnnotations[key]
+			if !ok {
 				break
 			}
 
@@ -293,26 +366,39 @@ func (enforcer *BpfEnforcer) eventHandler(stopCh <-chan struct{}) {
 					"pod name", info.PodName,
 					"container name", info.ContainerName,
 					"container id", info.ContainerID,
-					"pid", info.PID)
+					"pid", info.PID, "mnt ns id", info.MntNsID, "ips", info.PodIPs)
 
 				// create an enforceID
-				enforceID, err := enforcer.newEnforceID(info.PID)
+				enforceID, err := enforcer.newEnforceID(info.PID, info.PodIPs)
 				if err != nil {
 					logger.Error(err, "newEnforceID() failed")
 					break
 				}
 
-				// nothing needs to change when the container was been protected
+				// nothing needs to change if the container has already been protected
 				if oldEnforceID, ok := enforcer.containerCache[info.ContainerID]; ok {
 					if reflect.DeepEqual(oldEnforceID, enforceID) {
 						break
 					}
 				}
 
+				// add the Pod IPs to the map for the target container
+				if len(enforceID.ips) > 0 {
+					err = enforcer.setPodIps(enforceID.mntNsID, enforceID.ips)
+					if err != nil {
+						logger.Error(err, "setPodIps() failed")
+					}
+				}
+
 				// apply the BPF profile for the target container
-				err = enforcer.applyProfile(enforceID.mntNsID, profile.bpfContent)
+				err = enforcer.applyProfile(enforceID.mntNsID, profile.mode, profile.bpfContent)
 				if err != nil {
-					logger.Error(err, "applyProfile() failed")
+					logger.Error(err, "applyProfile() failed, cleaning up partial writes")
+					// applyProfile's defer already rolled back its own writes.
+					// Clean up setPodIps entry that was written before applyProfile.
+					if len(enforceID.ips) > 0 {
+						enforcer.removePodIps(enforceID.mntNsID)
+					}
 					break
 				}
 
@@ -323,10 +409,14 @@ func (enforcer *BpfEnforcer) eventHandler(stopCh <-chan struct{}) {
 			}
 
 		case info := <-enforcer.TaskDeleteCh:
+			// Handle the deletion event of target container
 			if enforceID, ok := enforcer.containerCache[info.ContainerID]; ok {
 				logger.Info("target container was deleted",
 					"container id", info.ContainerID,
 					"pid", info.PID)
+
+				// remove the Pod IPs from the map for the container
+				enforcer.removePodIps(enforceID.mntNsID)
 
 				// delete the BPF profile of the container
 				enforcer.deleteProfile(enforceID.mntNsID)
@@ -348,12 +438,15 @@ func (enforcer *BpfEnforcer) eventHandler(stopCh <-chan struct{}) {
 			// Handle those containers that exit while the monitor was offline
 			for profileName, profile := range enforcer.bpfProfileCache {
 				for containerID, enforceID := range profile.containerCache {
-					_, err := enforcer.newEnforceID(enforceID.pid)
+					_, err := enforcer.newEnforceID(enforceID.pid, []string{})
 					if err != nil {
 						// maybe the container had already exited
 						logger.Info("the target container exited while the monitor was offline",
 							"container id", containerID,
 							"pid", enforceID.pid)
+
+						// remove the Pod IPs from the map for the container
+						enforcer.removePodIps(enforceID.mntNsID)
 
 						// delete the BPF profile of the container
 						enforcer.deleteProfile(enforceID.mntNsID)
@@ -369,13 +462,14 @@ func (enforcer *BpfEnforcer) eventHandler(stopCh <-chan struct{}) {
 			}
 
 		case <-stopCh:
-			logger.Info("stop handle the containerd events")
+			logger.Info("stop handling the containerd events")
 			return
 		}
 	}
 }
 
 func (enforcer *BpfEnforcer) Run(stopCh <-chan struct{}) {
+	enforcer.startupGC()
 	enforcer.eventHandler(stopCh)
 }
 
@@ -432,22 +526,25 @@ func (enforcer *BpfEnforcer) pretreatment(bpfContent *varmor.BpfContent) {
 }
 
 // SaveAndApplyBpfProfile save the BPF profile to the cache, and update it to the kernel for the existing BPF profile
-func (enforcer *BpfEnforcer) SaveAndApplyBpfProfile(profileName string, bpfContent varmor.BpfContent) error {
+func (enforcer *BpfEnforcer) SaveAndApplyBpfProfile(profileName string, mode varmor.ProfileMode, bpfContent varmor.BpfContent) error {
 	enforcer.pretreatment(&bpfContent)
 
 	// save/update the BPF profile to the cache
 	if profile, ok := enforcer.bpfProfileCache[profileName]; ok {
-		if reflect.DeepEqual(bpfContent, profile.bpfContent) {
+		if mode == profile.mode && reflect.DeepEqual(bpfContent, profile.bpfContent) {
 			// nothing need to update
-			enforcer.log.V(3).Info("the BPF profile is not changed, nothing need to update", "profile", profileName, "old", profile.bpfContent)
+			enforcer.log.V(2).Info("the BPF profile is not changed, nothing need to update",
+				"profile name", profileName, "mode", mode, "profile", profile.bpfContent)
 			return nil
 		}
-		enforcer.log.V(3).Info("update the BPF profile", "profile", profileName, "new", bpfContent)
+		enforcer.log.V(2).Info("update the BPF profile", "profile name", profileName, "mode", mode, "profile", bpfContent)
+		profile.mode = mode
 		profile.bpfContent = bpfContent
 		enforcer.bpfProfileCache[profileName] = profile
 	} else {
-		enforcer.log.V(3).Info("save the BPF profile", "profile", profileName, "new", bpfContent)
+		enforcer.log.V(2).Info("save the BPF profile", "profile name", profileName, "mode", mode, "profile", bpfContent)
 		profile := bpfProfile{
+			mode:           mode,
 			bpfContent:     bpfContent,
 			containerCache: make(map[string]enforceID),
 		}
@@ -457,8 +554,8 @@ func (enforcer *BpfEnforcer) SaveAndApplyBpfProfile(profileName string, bpfConte
 	// apply the BPF profile to the kernel for the existing containers
 	profile := enforcer.bpfProfileCache[profileName]
 	for _, enforceID := range profile.containerCache {
-		enforcer.log.V(3).Info("apply the BPF profile", "profile", profileName, "new", profile.bpfContent)
-		err := enforcer.applyProfile(enforceID.mntNsID, profile.bpfContent)
+		enforcer.log.V(2).Info("apply the BPF profile", "profile name", profileName, "profile", profile.bpfContent)
+		err := enforcer.applyProfile(enforceID.mntNsID, profile.mode, profile.bpfContent)
 		if err != nil {
 			return err
 		}
@@ -470,6 +567,9 @@ func (enforcer *BpfEnforcer) SaveAndApplyBpfProfile(profileName string, bpfConte
 func (enforcer *BpfEnforcer) DeleteBpfProfile(profileName string) error {
 	if profile, ok := enforcer.bpfProfileCache[profileName]; ok {
 		for containerID, enforceID := range profile.containerCache {
+			// remove the Pod IPs from the map for the container
+			enforcer.removePodIps(enforceID.mntNsID)
+
 			// unload the BPF profile from the kernel
 			enforcer.deleteProfile(enforceID.mntNsID)
 

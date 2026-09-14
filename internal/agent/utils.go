@@ -15,7 +15,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,11 +23,7 @@ import (
 	"strings"
 
 	goversion "github.com/hashicorp/go-version"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
-	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-
-	varmorTypes "github.com/bytedance/vArmor/internal/types"
 )
 
 const (
@@ -90,7 +85,7 @@ func versionGreaterThanOrEqual(current, minimum string) (bool, error) {
 	if currentVersion.GreaterThanOrEqual(minVersion) {
 		return true, nil
 	}
-	return false, fmt.Errorf(fmt.Sprintf("the current version (%s) < the minimum version (%s)", current, minimum))
+	return false, fmt.Errorf("the current version (%s) < the minimum version (%s)", current, minimum)
 }
 
 func isLSMSupported(lsm string) (bool, error) {
@@ -133,28 +128,16 @@ func isSeccompSupported(versionInfo *version.Info) (bool, error) {
 }
 
 // retrieveNodeName retrieve nodeName from the varmor:agent pod's specification.
-func retrieveNodeName(podInterface corev1.PodInterface, debug bool) (string, error) {
-	if debug {
+func retrieveNodeName(inContainer bool) (string, error) {
+	if !inContainer {
 		return os.Hostname()
 	}
 
-	pod, err := podInterface.Get(context.Background(), os.Getenv("HOSTNAME"), metav1.GetOptions{})
-	if err == nil {
-		return pod.Spec.NodeName, nil
-	} else {
-		return "", err
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		return "", fmt.Errorf("the NODE_NAME environment variable doesn't exist")
 	}
-}
-
-func newProfileStatus(namespace, name, nodeName string, status varmorTypes.Status, message string) *varmorTypes.ProfileStatus {
-	s := varmorTypes.ProfileStatus{
-		Namespace:   namespace,
-		ProfileName: name,
-		NodeName:    nodeName,
-		Status:      status,
-		Message:     message,
-	}
-	return &s
+	return nodeName, nil
 }
 
 // This profile is not used to be loaded into the kernel.

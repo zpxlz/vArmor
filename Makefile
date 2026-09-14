@@ -1,5 +1,8 @@
 PWD := $(CURDIR)
 GIT_VERSION := $(shell git describe --tags --match "v[0-9]*")
+GIT_COMMIT := $(shell git rev-parse "HEAD^{commit}" 2>/dev/null)
+BUILD_DATE := $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+GO_VERSION := $(shell go version | awk '{print $$3}')
 VARMOR_PATH := cmd/varmor
 CLASSIFIER_PATH := cmd/classifier
 
@@ -17,19 +20,24 @@ VARMOR_IMAGE_TAG_DEV := $(GIT_VERSION)
 CLASSIFIER_IMAGE_NAME := classifier
 CLASSIFIER_IMAGE_TAG := $(VARMOR_IMAGE_TAG)
 CLASSIFIER_IMAGE_TAG_DEV := $(VARMOR_IMAGE_TAG_DEV)
+PROXYINIT_IMAGE_NAME := proxyinit
+PROXYINIT_IMAGE_TAG := v0.2
+PROXY_IMAGE_NAME:= envoy
+PROXY_IMAGE_TAG := v1.38-latest
 
 VARMOR_IMAGE_AP ?= $(REPO_AP)/$(VARMOR_IMAGE_NAME):$(VARMOR_IMAGE_TAG)
 VARMOR_IMAGE_DEV ?= $(REPO_DEV)/$(VARMOR_IMAGE_NAME):$(VARMOR_IMAGE_TAG_DEV)
 CLASSIFIER_IMAGE_AP ?= $(REPO_AP)/$(CLASSIFIER_IMAGE_NAME):$(CLASSIFIER_IMAGE_TAG)
 CLASSIFIER_IMAGE_DEV ?= $(REPO_DEV)/$(CLASSIFIER_IMAGE_NAME):$(CLASSIFIER_IMAGE_TAG_DEV)
+PROXYINIT_IMAGE_AP ?= $(REPO_AP)/$(PROXYINIT_IMAGE_NAME):$(PROXYINIT_IMAGE_TAG)
+PROXYINIT_IMAGE_DEV ?= $(REPO_DEV)/$(PROXYINIT_IMAGE_NAME):$(PROXYINIT_IMAGE_TAG)
+PROXY_IMAGE_AP ?= $(REPO_AP)/$(PROXY_IMAGE_NAME):$(PROXY_IMAGE_TAG)
+PROXY_IMAGE_DEV ?= $(REPO_DEV)/$(PROXY_IMAGE_NAME):$(PROXY_IMAGE_TAG)
 
 CHART_APP_VERSION := $(VARMOR_IMAGE_TAG)
 CHART_APP_VERSION_DEV := $(GIT_VERSION)
-CHART_VERSION := $(shell echo $(CHART_APP_VERSION)| sed 's/^v//')
-CHART_VERSION_DEV := $(shell echo $(CHART_APP_VERSION_DEV)| sed 's/^v//')
-
-# ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.20
+CHART_VERSION := $(shell echo $(CHART_APP_VERSION) | sed 's/^v//')
+CHART_VERSION_DEV := $(shell echo $(CHART_APP_VERSION_DEV) | sed 's/^v//')
 
 KERNEL_RELEASE = $(shell uname -r)
 APPARMOR_ABI_NAME = kernel-$(KERNEL_RELEASE)
@@ -39,6 +47,13 @@ ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
 else
 GOBIN=$(shell go env GOBIN)
+endif
+
+ifeq (,$(shell which goimports))
+$(shell go install golang.org/x/tools/cmd/goimports@latest)
+GO_IMPORTS=$(shell which goimports)
+else
+GO_IMPORTS=$(shell which goimports)
 endif
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
@@ -64,7 +79,7 @@ endef
 # Download controller-gen locally if necessary.
 CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
 controller-gen:
-	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.11.3)
+	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3)
 
 # Download envtest-setup locally if necessary.
 ENVTEST = $(shell pwd)/bin/setup-envtest
@@ -102,8 +117,8 @@ generate-apparmor-abi: ## Generate the AppArmor feature ABI of development envir
 	cp config/apparmor.d/abi/$(APPARMOR_ABI_NAME) config/apparmor.d/abi/varmor
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	@echo "[+] Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects"
+manifests: controller-gen ## Generate CustomResourceDefinition objects.
+	@echo "[+] Generate CustomResourceDefinition objects"
 	$(CONTROLLER_GEN) crd paths="./apis/varmor/..." output:crd:artifacts:config=config/crds
 	cp config/crds/* manifests/varmor/templates/crds/
 
@@ -122,21 +137,12 @@ build-ebpf: ## Generate the ebpf code and lib.
 .PHONY: copy-ebpf
 copy-ebpf: ## Copy the ebpf code and lib.
 	@echo "[+] Copy the ebpf code and lib."
-	cp vArmor-ebpf/pkg/tracer/bpf_bpfel.go internal/behavior/tracer
-	cp vArmor-ebpf/pkg/tracer/bpf_bpfel.o internal/behavior/tracer
+	cp vArmor-ebpf/pkg/processtracer/bpf_bpfel.go pkg/processtracer
+	cp vArmor-ebpf/pkg/processtracer/bpf_bpfel.o pkg/processtracer
 	cp vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.go pkg/lsm/bpfenforcer
 	cp vArmor-ebpf/pkg/bpfenforcer/bpf_bpfel.o pkg/lsm/bpfenforcer
-
-goimports:
-ifeq (, $(shell which goimports))
-	@{ \
-	echo "goimports not found!";\
-	echo "installing goimports...";\
-	go install golang.org/x/tools/cmd/goimports;\
-	}
-else
-GO_IMPORTS=$(shell which goimports)
-endif
+	cp vArmor-ebpf/pkg/bpfenforcer/bpfloop_bpfel.go pkg/lsm/bpfenforcer
+	cp vArmor-ebpf/pkg/bpfenforcer/bpfloop_bpfel.o pkg/lsm/bpfenforcer
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -154,17 +160,25 @@ test-unit: ## Run unit tests.
 	go test ./... -coverprofile coverage.out
 
 .PHONY: test
-test: manifests generate fmt vet test-unit ## Run tests.
+test: manifests generate fmt verify-mozilla-bundle vet test-unit ## Run tests.
 
 
 ##@ Build
 .PHONY: local
 local: ## Build local binary.
 	@echo "[+] Build local binary."
-	go build -o bin/vArmor $(PWD)/$(VARMOR_PATH)
+	go build -o bin/vArmor \
+          -ldflags "-X 'k8s.io/client-go/pkg/version.gitVersion=${GIT_VERSION}' \
+                    -X 'k8s.io/client-go/pkg/version.gitCommit=${GIT_COMMIT}' \
+                    -X 'k8s.io/client-go/pkg/version.buildDate=${BUILD_DATE}' \
+                    -X 'main.gitVersion=${GIT_VERSION}' \
+                    -X 'main.gitCommit=${GIT_COMMIT}' \
+                    -X 'main.buildDate=${BUILD_DATE}' \
+                    -X 'main.goVersion=${GO_VERSION}'" \
+          $(PWD)/$(VARMOR_PATH)
 
 .PHONY: build
-build: manifests generate build-ebpf copy-ebpf vet local ## Build local binary when apis or bpf code were modified.
+build: manifests generate update-mozilla-bundle build-ebpf copy-ebpf vet local ## Build local binary when apis or bpf code were modified.
 
 .PHONY: docker-build
 docker-build: docker-build-varmor-amd64 docker-build-varmor-arm64 docker-build-classifier-amd64 docker-build-classifier-arm64 ## Build container images. 
@@ -178,11 +192,11 @@ docker-build-dev-ci: docker-build-varmor-amd64-dev docker-build-classifier-amd64
 
 docker-build-varmor-amd64:
 	@echo "[+] Build varmor-amd64 image for release version"
-	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_AP)-amd64 --platform linux/amd64 --build-arg TARGETPLATFORM="linux/amd64" --load .
+	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_AP)-amd64 --platform linux/amd64 --build-arg GITVERSION=$(GIT_VERSION) --build-arg GITCOMMIT=$(GIT_COMMIT) --build-arg BUILDDATE=$(BUILD_DATE) --load .
 
 docker-build-varmor-arm64:
 	@echo "[+] Build varmor-arm64 image for the release version"
-	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_AP)-arm64 --platform linux/arm64 --build-arg TARGETPLATFORM="linux/arm64" --load .
+	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_AP)-arm64 --platform linux/arm64 --build-arg GITVERSION=$(GIT_VERSION) --build-arg GITCOMMIT=$(GIT_COMMIT) --build-arg BUILDDATE=$(BUILD_DATE) --load .
 
 docker-build-classifier-amd64:
 	@echo "[+] Build classifier-amd64 image for the release version"
@@ -194,11 +208,11 @@ docker-build-classifier-arm64:
 
 docker-build-varmor-amd64-dev:
 	@echo "[+] Build varmor-amd64 image for the development version"
-	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_DEV)-amd64 --platform linux/amd64 --build-arg TARGETPLATFORM="linux/amd64" --load .
+	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_DEV)-amd64 --platform linux/amd64 --build-arg GITVERSION=$(GIT_VERSION) --build-arg GITCOMMIT=$(GIT_COMMIT) --build-arg BUILDDATE=$(BUILD_DATE) --load .
 
 docker-build-varmor-arm64-dev:
 	@echo "[+] Build varmor-arm64 image for the development version"
-	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_DEV)-arm64 --platform linux/arm64 --build-arg TARGETPLATFORM="linux/arm64" --load .
+	@docker buildx build --file $(PWD)/$(VARMOR_PATH)/Dockerfile --tag $(VARMOR_IMAGE_DEV)-arm64 --platform linux/arm64 --build-arg GITVERSION=$(GIT_VERSION) --build-arg GITCOMMIT=$(GIT_COMMIT) --build-arg BUILDDATE=$(BUILD_DATE) --load .
 
 docker-build-classifier-amd64-dev:
 	@echo "[+] Build classifier-amd64 image for the development version"
@@ -207,6 +221,21 @@ docker-build-classifier-amd64-dev:
 docker-build-classifier-arm64-dev:
 	@echo "[+] Build classifier-arm64 image for the development version"
 	@docker buildx build --file $(PWD)/$(CLASSIFIER_PATH)/Dockerfile --tag $(CLASSIFIER_IMAGE_DEV)-arm64 --platform linux/arm64 --load .
+
+docker-build-proxyinit:
+	@echo "[+] Build proxyinit image"
+	@docker buildx build --file $(PWD)/tools/proxyinit/Dockerfile --tag $(PROXYINIT_IMAGE_AP)-amd64 --platform linux/amd64 --load .
+	@docker buildx build --file $(PWD)/tools/proxyinit/Dockerfile --tag $(PROXYINIT_IMAGE_AP)-arm64 --platform linux/arm64 --load .
+	@docker buildx build --file $(PWD)/tools/proxyinit/Dockerfile --tag $(PROXYINIT_IMAGE_DEV)-amd64 --platform linux/amd64 --load .
+	@docker buildx build --file $(PWD)/tools/proxyinit/Dockerfile --tag $(PROXYINIT_IMAGE_DEV)-arm64 --platform linux/arm64 --load .
+
+docker-build-proxy:
+	@echo "[+] Build custom envoy image"
+	@docker buildx build --file $(PWD)/cmd/networkproxy/Dockerfile --tag $(PROXY_IMAGE_AP)-amd64 --platform linux/amd64 --load .
+	@docker buildx build --file $(PWD)/cmd/networkproxy/Dockerfile --tag $(PROXY_IMAGE_AP)-arm64 --platform linux/arm64 --load .
+	@docker buildx build --file $(PWD)/cmd/networkproxy/Dockerfile --tag $(PROXY_IMAGE_DEV)-amd64 --platform linux/amd64 --load .
+	@docker buildx build --file $(PWD)/cmd/networkproxy/Dockerfile --tag $(PROXY_IMAGE_DEV)-arm64 --platform linux/arm64 --load .
+
 docker-save-ci-dev:
 	@docker tag  $(VARMOR_IMAGE_DEV)-amd64 $(VARMOR_IMAGE_DEV)
 	@docker tag  $(CLASSIFIER_IMAGE_DEV)-amd64 $(CLASSIFIER_IMAGE_DEV)
@@ -231,6 +260,30 @@ demo-package: ## Package the demo resources.
 
 ##@ Push artifacts (Note: Logging in to the registry is required beforehand.)
 .PHONY: push
+push: ## Push images and chart to the public repository for release.
+	docker push $(VARMOR_IMAGE_AP)-amd64
+	@echo "----------------------------------------"
+	docker push $(VARMOR_IMAGE_AP)-arm64
+	@echo "----------------------------------------"
+	-docker manifest rm $(VARMOR_IMAGE_AP)
+	@echo "----------------------------------------"
+	docker manifest create $(VARMOR_IMAGE_AP) $(VARMOR_IMAGE_AP)-amd64 $(VARMOR_IMAGE_AP)-arm64
+	@echo "----------------------------------------"
+	docker manifest push $(VARMOR_IMAGE_AP)
+	@echo "----------------------------------------"
+	docker push $(CLASSIFIER_IMAGE_AP)-amd64
+	@echo "----------------------------------------"
+	docker push $(CLASSIFIER_IMAGE_AP)-arm64
+	@echo "----------------------------------------"
+	-docker manifest rm $(CLASSIFIER_IMAGE_AP)
+	@echo "----------------------------------------"
+	docker manifest create $(CLASSIFIER_IMAGE_AP) $(CLASSIFIER_IMAGE_AP)-amd64 $(CLASSIFIER_IMAGE_AP)-arm64
+	@echo "----------------------------------------"
+	docker manifest push $(CLASSIFIER_IMAGE_AP)
+	@echo "----------------------------------------"
+	helm push varmor-$(CHART_VERSION).tgz oci://$(REPO_AP)
+
+.PHONY: push-dev
 push-dev: ## Push images and chart to the private repository for development.
 	docker push $(VARMOR_IMAGE_DEV)-amd64
 	@echo "----------------------------------------"
@@ -254,25 +307,126 @@ push-dev: ## Push images and chart to the private repository for development.
 	@echo "----------------------------------------"
 	helm push varmor-$(CHART_VERSION_DEV).tgz oci://$(REPO_DEV)
 
-push: ## Push images and chart to the public repository for release.
-	docker push $(VARMOR_IMAGE_AP)-amd64
+.PHONY: push-proxy-images
+push-proxy-images: ## Push proxy images to the public repository for release.
+	docker push $(PROXYINIT_IMAGE_AP)-amd64
 	@echo "----------------------------------------"
-	docker push $(VARMOR_IMAGE_AP)-arm64
+	docker push $(PROXYINIT_IMAGE_AP)-arm64
 	@echo "----------------------------------------"
-	-docker manifest rm $(VARMOR_IMAGE_AP)
+	-docker manifest rm $(PROXYINIT_IMAGE_AP)
 	@echo "----------------------------------------"
-	docker manifest create $(VARMOR_IMAGE_AP) $(VARMOR_IMAGE_AP)-amd64 $(VARMOR_IMAGE_AP)-arm64
+	docker manifest create $(PROXYINIT_IMAGE_AP) $(PROXYINIT_IMAGE_AP)-amd64 $(PROXYINIT_IMAGE_AP)-arm64
 	@echo "----------------------------------------"
-	docker manifest push $(VARMOR_IMAGE_AP)
+	docker manifest push $(PROXYINIT_IMAGE_AP)
 	@echo "----------------------------------------"
-	docker push $(CLASSIFIER_IMAGE_AP)-amd64
+	docker push $(PROXY_IMAGE_AP)-amd64
 	@echo "----------------------------------------"
-	docker push $(CLASSIFIER_IMAGE_AP)-arm64
+	docker push $(PROXY_IMAGE_AP)-arm64
 	@echo "----------------------------------------"
-	-docker manifest rm $(CLASSIFIER_IMAGE_AP)
+	-docker manifest rm $(PROXY_IMAGE_AP)
 	@echo "----------------------------------------"
-	docker manifest create $(CLASSIFIER_IMAGE_AP) $(CLASSIFIER_IMAGE_AP)-amd64 $(CLASSIFIER_IMAGE_AP)-arm64
+	docker manifest create $(PROXY_IMAGE_AP) $(PROXY_IMAGE_AP)-amd64 $(PROXY_IMAGE_AP)-arm64
 	@echo "----------------------------------------"
-	docker manifest push $(CLASSIFIER_IMAGE_AP)
+	docker manifest push $(PROXY_IMAGE_AP)
 	@echo "----------------------------------------"
-	helm push varmor-$(CHART_VERSION).tgz oci://$(REPO_AP)
+
+.PHONY: push-proxy-images-dev
+push-proxy-images-dev: ## Push proxy images to the private repository for development.
+	docker push $(PROXYINIT_IMAGE_DEV)-amd64
+	@echo "----------------------------------------"
+	docker push $(PROXYINIT_IMAGE_DEV)-arm64
+	@echo "----------------------------------------"
+	-docker manifest rm $(PROXYINIT_IMAGE_DEV)
+	@echo "----------------------------------------"
+	docker manifest create $(PROXYINIT_IMAGE_DEV) $(PROXYINIT_IMAGE_DEV)-amd64 $(PROXYINIT_IMAGE_DEV)-arm64
+	@echo "----------------------------------------"
+	docker manifest push $(PROXYINIT_IMAGE_DEV)
+	@echo "----------------------------------------"
+	docker push $(PROXY_IMAGE_DEV)-amd64
+	@echo "----------------------------------------"
+	docker push $(PROXY_IMAGE_DEV)-arm64
+	@echo "----------------------------------------"
+	-docker manifest rm $(PROXY_IMAGE_DEV)
+	@echo "----------------------------------------"
+	docker manifest create $(PROXY_IMAGE_DEV) $(PROXY_IMAGE_DEV)-amd64 $(PROXY_IMAGE_DEV)-arm64
+	@echo "----------------------------------------"
+	docker manifest push $(PROXY_IMAGE_DEV)
+
+
+##@ MITM Certificate Bundle
+
+# Location of the embedded Mozilla CA bundle consumed by the MITM
+# package via go:embed. Regenerated in-place so that go:embed picks up
+# the new content at the next go build.
+MOZILLA_BUNDLE_PATH  ?= internal/networkproxy/mitm/certs/mozilla.pem
+MOZILLA_BUNDLE_URL   ?= https://curl.se/ca/cacert.pem
+MOZILLA_BUNDLE_SHA   ?= https://curl.se/ca/cacert.pem.sha256
+
+# Set SKIP_MOZILLA_BUNDLE_UPDATE=1 to keep the vendored bundle unchanged
+# (offline builds, air-gapped CI, reproducibility pinning).
+SKIP_MOZILLA_BUNDLE_UPDATE ?=
+
+.PHONY: update-mozilla-bundle
+update-mozilla-bundle: ## Refresh the embedded Mozilla CA bundle used by the MITM package.
+ifeq ($(strip $(SKIP_MOZILLA_BUNDLE_UPDATE)),)
+	@echo "[+] Refreshing Mozilla CA bundle from $(MOZILLA_BUNDLE_URL)"
+	@set -eu; \
+	 tmpdir=$$(mktemp -d); \
+	 bundle_tmp=""; \
+	 checksum_tmp=""; \
+	 trap 'rm -rf "$$tmpdir"; [ -z "$$bundle_tmp" ] || rm -f "$$bundle_tmp"; [ -z "$$checksum_tmp" ] || rm -f "$$checksum_tmp"' EXIT HUP INT TERM; \
+	 curl -fsSL --retry 3 --retry-delay 2 -o "$$tmpdir/cacert.pem"        "$(MOZILLA_BUNDLE_URL)"; \
+	 curl -fsSL --retry 3 --retry-delay 2 -o "$$tmpdir/cacert.pem.sha256" "$(MOZILLA_BUNDLE_SHA)"; \
+	 ( cd "$$tmpdir" && sha256sum -c cacert.pem.sha256 ); \
+	 bundle_tmp=$$(mktemp "$(MOZILLA_BUNDLE_PATH).tmp.XXXXXX"); \
+	 checksum_tmp=$$(mktemp "$(MOZILLA_BUNDLE_PATH).sha256.tmp.XXXXXX"); \
+	 install -m 0644 "$$tmpdir/cacert.pem" "$$bundle_tmp"; \
+	 expected_line=$$(sed -n '1p' "$$tmpdir/cacert.pem.sha256"); \
+	 expected_sha=$${expected_line%% *}; \
+	 actual_line=$$(sha256sum "$$bundle_tmp"); \
+	 actual_sha=$${actual_line%% *}; \
+	 if [ "$$actual_sha" != "$$expected_sha" ]; then \
+	   echo "[-] Installed Mozilla CA bundle does not match the published SHA-256" >&2; \
+	   exit 1; \
+	 fi; \
+	 printf '%s\n' "$$actual_sha" > "$$checksum_tmp"; \
+	 chmod 0644 "$$checksum_tmp"; \
+	 mv "$$bundle_tmp" "$(MOZILLA_BUNDLE_PATH)"; \
+	 bundle_tmp=""; \
+	 mv "$$checksum_tmp" "$(MOZILLA_BUNDLE_PATH).sha256"; \
+	 checksum_tmp=""; \
+	 echo "[+] Updated $(MOZILLA_BUNDLE_PATH)"
+else
+	@echo "[=] SKIP_MOZILLA_BUNDLE_UPDATE set, keeping existing $(MOZILLA_BUNDLE_PATH)"
+endif
+	@$(MAKE) --no-print-directory verify-mozilla-bundle
+
+.PHONY: verify-mozilla-bundle
+verify-mozilla-bundle: ## Verify the embedded Mozilla CA bundle against its vendored SHA-256.
+	@set -eu; \
+	 checksum_path="$(MOZILLA_BUNDLE_PATH).sha256"; \
+	 if [ ! -s "$(MOZILLA_BUNDLE_PATH)" ]; then \
+	   echo "[-] Mozilla CA bundle is missing or empty: $(MOZILLA_BUNDLE_PATH)" >&2; \
+	   exit 1; \
+	 fi; \
+	 if [ ! -s "$$checksum_path" ]; then \
+	   echo "[-] Mozilla CA bundle checksum is missing or empty: $$checksum_path" >&2; \
+	   exit 1; \
+	 fi; \
+	 expected_sha=$$(cat "$$checksum_path"); \
+	 case "$$expected_sha" in \
+	   *[!0-9a-f]*|'') echo "[-] Invalid SHA-256 in $$checksum_path" >&2; exit 1 ;; \
+	 esac; \
+	 if [ "$${#expected_sha}" -ne 64 ]; then \
+	   echo "[-] Invalid SHA-256 length in $$checksum_path" >&2; \
+	   exit 1; \
+	 fi; \
+	 actual_line=$$(sha256sum "$(MOZILLA_BUNDLE_PATH)"); \
+	 actual_sha=$${actual_line%% *}; \
+	 if [ "$$actual_sha" != "$$expected_sha" ]; then \
+	   echo "[-] Mozilla CA bundle SHA-256 mismatch" >&2; \
+	   echo "    expected: $$expected_sha" >&2; \
+	   echo "    actual:   $$actual_sha" >&2; \
+	   exit 1; \
+	 fi; \
+	 echo "[+] Verified $(MOZILLA_BUNDLE_PATH) ($$actual_sha)"

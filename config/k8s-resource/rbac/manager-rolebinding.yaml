@@ -3,8 +3,6 @@ kind: RoleBinding
 metadata:
   name: varmor-manager
   namespace: varmor
-  labels:
-    app: varmor
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

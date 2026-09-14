@@ -24,7 +24,6 @@ import "C"
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -34,22 +33,53 @@ import (
 	"unsafe"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
-	varmortypes "github.com/bytedance/vArmor/internal/types"
 	varmorutils "github.com/bytedance/vArmor/internal/utils"
 )
 
+type AaLogRecord struct {
+	Resource      string
+	ActiveHat     string
+	AaMode        string
+	Time          int64
+	Operation     string
+	Profile       string
+	Name          string
+	Name2         string
+	Attr          string
+	Parent        uint64
+	Pid           uint64
+	Task          uint64
+	Info          string
+	ErrorCode     int32
+	DeniedMask    string
+	RequestedMask string
+	MagicToken    uint64
+	Family        string
+	Protocol      string
+	SockType      string
+	Fsuid         uint64
+	Ouid          uint64
+	Signal        string
+	Peer          string
+	PeerProfile   string
+	Bus           string
+	Path          string
+	Interface     string
+	Member        string
+}
+
 const (
-	regexProc      = "\\/proc\\/[0-9]+"
-	regexProcTask  = "\\/proc\\/[0-9]+\\/task\\/[0-9]+"
-	regexSnapshots = "\\/snapshots\\/\\d+\\/fs\\/" // \/snapshots\/\d+\/fs\/
-	regexOverlay   = "\\b\\d+\\b"                  //  \b\d+\b   \\/\\d+\\/
+	regexProcNumber = "\\/[0-9]+"
+	regexMapFile    = "\\/map_files\\/.*"
+	regexSnapshots  = "\\/snapshots\\/\\d+\\/fs\\/" // \/snapshots\/\d+\/fs\/
+	regexOverlay    = "\\b\\d+\\b"                  //  \b\d+\b   \\/\\d+\\/
 )
 
 var (
-	procRegex      = regexp.MustCompile(regexProc)
-	procTaskRegex  = regexp.MustCompile(regexProcTask)
-	snapshotsRegex = regexp.MustCompile(regexSnapshots)
-	overlayRegex   = regexp.MustCompile(regexOverlay)
+	procNumberRegex = regexp.MustCompile(regexProcNumber)
+	mapFilesRegex   = regexp.MustCompile(regexMapFile)
+	snapshotsRegex  = regexp.MustCompile(regexSnapshots)
+	overlayRegex    = regexp.MustCompile(regexOverlay)
 
 	modeConvertor = map[uint32]string{
 		0: "INVALID",
@@ -137,7 +167,7 @@ func (p *DataPreprocessor) converProfileToParents(profile string) string {
 }
 
 // Returns the operation type if known, unknown otherwise.
-func (p *DataPreprocessor) opType(event *varmortypes.AaLogRecord) string {
+func (p *DataPreprocessor) opType(event *AaLogRecord) string {
 	if strings.HasPrefix(event.Operation, "file_") ||
 		strings.HasPrefix(event.Operation, "inode_") ||
 		event.Operation == "create" ||
@@ -186,100 +216,7 @@ func (p *DataPreprocessor) opType(event *varmortypes.AaLogRecord) string {
 	}
 }
 
-func (p *DataPreprocessor) trimPath(path, dmask string) string {
-	// In rare cases, the path may be an absolute path in the host.
-	// We need to replace the digits to '*'
-	// e.g.
-	//    /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/86/fs/etc/nginx/geoip/ -->
-	//    /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/*/fs/etc/nginx/geoip/
-	// 	  /containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/149/fs/etc/ -->
-	//	  /containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/*/fs/etc/
-	// Attention:
-	//    This may cause compatibility issues if nodes use different runtime.
-	//    This feature is necessary, because the child process need the access to the file when AppArmor LSM does mandatory access control.)
-	// TODO:
-	//	  Analyze the root reason of these case.
-	overlayPath := false
-	for _, prefix := range overlayPrefixes {
-		if strings.HasPrefix(path, prefix) {
-			path = overlayRegex.ReplaceAllString(path, "*")
-			overlayPath = true
-			break
-		}
-	}
-	if !overlayPath && strings.Contains(path, "/snapshots/") && strings.Contains(path, "/fs/") {
-		path = snapshotsRegex.ReplaceAllString(path, "/snapshots/*/fs/")
-	}
-
-	// Reduce the number of rules for the system dynamic library.
-	if !strings.Contains(dmask, "a") && !strings.Contains(dmask, "w") && !strings.Contains(dmask, "l") && !strings.Contains(dmask, "k") {
-		if path == "/lib/x86_64-linux-gnu/" {
-			return path
-		} else if strings.HasPrefix(path, "/lib/x86_64-linux-gnu/") {
-			return "/lib/x86_64-linux-gnu/**"
-		} else if path == "/usr/lib/x86_64-linux-gnu/" {
-			return path
-		} else if strings.HasPrefix(path, "/usr/lib/x86_64-linux-gnu/") {
-			return "/usr/lib/x86_64-linux-gnu/**"
-		} else if path == "/usr/lib/aarch64-linux-gnu/" {
-			return path
-		} else if strings.HasPrefix(path, "/usr/lib/aarch64-linux-gnu/") {
-			return "/usr/lib/aarch64-linux-gnu/**"
-		}
-	}
-
-	// Reduce the number of rules for /tmp directory
-	// e.g. /tmp、/tmp/、/tmp/dwda.lgo、/tmp/dw/fw.log
-	if strings.HasPrefix(path, "/tmp/") {
-		if path != "/tmp/" {
-			return "/tmp/**"
-		} else {
-			return "/tmp/"
-		}
-	}
-
-	// For ServiceAccount token/namespace/...
-	if strings.HasPrefix(path, "/run/secrets/kubernetes.io/serviceaccount/") {
-		return "/run/secrets/kubernetes.io/serviceaccount/**"
-	} else if strings.HasPrefix(path, "/var/run/secrets/kubernetes.io/serviceaccount/") {
-		return "/var/run/secrets/kubernetes.io/serviceaccount/**"
-	}
-
-	// Reduce the number of rules for /proc/[PID]/task/[PID]/*, /proc/[PID]/*, /xxxx/proc/[PID]/*, ...
-	// TODO: * ? ** ?
-	if strings.HasPrefix(path, "/proc") {
-		if strings.Contains(path, "/task") {
-			path = procTaskRegex.ReplaceAllString(path, "/proc/*/task/*")
-		}
-		path = procRegex.ReplaceAllString(path, "/proc/*")
-		return path
-	}
-
-	// Exclude some sensitive directories before replacing the random pattern of path with the classifier.
-	for _, excludePath := range randomExclusions {
-		if strings.HasPrefix(path, excludePath) {
-			return path
-		}
-	}
-
-	// Replace the random pattern of path with the classifier.
-	output, err := varmorutils.RequestClassifierService([]byte(path), p.debug, p.mlIP, p.mlPort)
-	if err != nil {
-		p.log.Error(err, "varmorutils.RequestClassifierService() failed")
-		return path
-	}
-
-	index := bytes.IndexByte(output, 0)
-	if index == -1 {
-		path = string(output)
-	} else {
-		path = string(output[0:index])
-	}
-
-	return path
-}
-
-func (p *DataPreprocessor) parseAppArmorEventForTree(event *varmortypes.AaLogRecord) error {
+func (p *DataPreprocessor) parseAppArmorEventForTree(event *AaLogRecord) error {
 	// aamode is aa_log_record.event, the type of aa_log_record.event is aa_record_event_type
 	// aa_record_event_type was defined in /apparmor/libraries/libapparmor/include/aalogparse.h
 	switch event.AaMode {
@@ -357,7 +294,7 @@ func (p *DataPreprocessor) parseAppArmorEventForTree(event *varmortypes.AaLogRec
 							p.behaviorData.DynamicResult.AppArmor.Files[i].Permissions = append(p.behaviorData.DynamicResult.AppArmor.Files[i].Permissions, string(perm))
 						}
 					} else {
-						return fmt.Errorf(fmt.Sprintf("log event contains unknown denied_mask %s", dmask))
+						return fmt.Errorf("log event contains unknown denied_mask %s", dmask)
 					}
 				}
 
@@ -387,7 +324,7 @@ func (p *DataPreprocessor) parseAppArmorEventForTree(event *varmortypes.AaLogRec
 					file.Permissions = append(file.Permissions, string(perm))
 				}
 			} else {
-				return fmt.Errorf(fmt.Sprintf("log event contains unknown denied_mask %s", dmask))
+				return fmt.Errorf("log event contains unknown denied_mask %s", dmask)
 			}
 		}
 
@@ -409,22 +346,26 @@ func (p *DataPreprocessor) parseAppArmorEventForTree(event *varmortypes.AaLogRec
 
 	// Network
 	if opType == "net" {
-		for _, n := range p.behaviorData.DynamicResult.AppArmor.Networks {
-			if n.Family == event.Family && n.SockType != "" && n.SockType == event.SockType {
+		if p.behaviorData.DynamicResult.AppArmor.Network == nil {
+			p.behaviorData.DynamicResult.AppArmor.Network = &varmor.Network{}
+		}
+
+		for _, n := range p.behaviorData.DynamicResult.AppArmor.Network.Sockets {
+			if n.Domain == event.Family && n.Type != "" && n.Type == event.SockType {
 				return nil
 			}
 
-			if n.Family == event.Family && n.SockType == event.SockType && n.Protocol == event.Protocol {
+			if n.Domain == event.Family && n.Type == event.SockType && n.Protocol == event.Protocol {
 				return nil
 			}
 		}
 
-		net := varmor.Network{
-			Family:   event.Family,
-			SockType: event.SockType,
+		socket := varmor.Socket{
+			Domain:   event.Family,
+			Type:     event.SockType,
 			Protocol: event.Protocol,
 		}
-		p.behaviorData.DynamicResult.AppArmor.Networks = append(p.behaviorData.DynamicResult.AppArmor.Networks, net)
+		p.behaviorData.DynamicResult.AppArmor.Network.Sockets = append(p.behaviorData.DynamicResult.AppArmor.Network.Sockets, socket)
 		return nil
 	}
 
@@ -512,7 +453,7 @@ func (p *DataPreprocessor) parseAppArmorEventForTree(event *varmortypes.AaLogRec
 	return nil
 }
 
-func parseAppArmorEvent(line string) (*varmortypes.AaLogRecord, error) {
+func parseAppArmorEvent(line string) (*AaLogRecord, error) {
 	// Normalize audit events from rsyslog.
 	// 		rsyslog format: <5>Nov 28 10:12:32 n248-145-253 kernel: [5326493.467434] audit: type=1400 audit(1669601552.623:916365): apparmor="STATUS" ...
 	// 		auditd format: type=AVC msg=audit(1669252886.558:860805): apparmor="STATUS" ...
@@ -531,7 +472,7 @@ func parseAppArmorEvent(line string) (*varmortypes.AaLogRecord, error) {
 		return nil, fmt.Errorf("parse_record() failed")
 	}
 
-	r := varmortypes.AaLogRecord{
+	r := AaLogRecord{
 		Resource:      C.GoString(record.info),
 		ActiveHat:     C.GoString(record.active_hat),
 		Time:          int64(record.epoch),

@@ -1,0 +1,225 @@
+# Introduction
+English | [简体中文](README.zh_CN.md)
+
+Learn about vArmor and create your first policy through a Quick Start guide.
+
+## About vArmor
+
+vArmor is a cloud-native container hardening system. It leverages Linux's [AppArmor LSM](https://en.wikipedia.org/wiki/AppArmor), [BPF LSM](https://docs.kernel.org/bpf/prog_lsm.html), [Seccomp](https://en.wikipedia.org/wiki/Seccomp), and **Network Proxy** ([Envoy](https://www.envoyproxy.io/)-based sidecar) technologies to implement enforcers. It can be used to strengthen container isolation, reduce the kernel attack surface, enforce network egress access control at L4/L7 levels, and increase the difficulty and cost of container escape or lateral movement attacks. You can leverage vArmor in the following scenarios to provide sandbox protection for containers within a Kubernetes cluster.
+* In multi-tenant environments, hardware-virtualized container solutions cannot be employed due to factors such as cost and technical conditions.
+* When there is a need to enhance the security of critical business containers, making it more difficult for attackers to escalate privileges, escape, or laterally move.
+* When high-risk vulnerabilities are present, but immediate remediation is not possible due to the difficulty or lengthy process of patching. vArmor can be used to mitigate the risks (depending on the vulnerability type or exploitation vector) to block or increase the difficulty of exploitation.
+* You are deploying AI Agents or LLM-based applications and need to precisely control their outbound network access — preventing data exfiltration, unauthorized API calls, or abuse induced by prompt injection attacks.
+
+*Note:* 
+*<br />- The core of security defense lies in balancing risks and benefits, transforming uncontrollable risks into controllable costs by choosing different types of security boundaries and defense technologies.*
+*<br />- runc + vArmor does not provide an isolation level equivalent to that of hardware virtualization containers (such as Kata Containers and other lightweight virtual machines). If you require a high-intensity isolation solution, please consider using hardware virtualization containers for compute isolation, and utilize CNI's NetworkPolicy for network isolation.*
+*<br />- vArmor's NetworkProxy enforcer further complements NetworkPolicy by providing L7 access control, TLS SNI-based domain filtering, and comprehensive audit logging — capabilities that NetworkPolicy does not offer.*
+
+**vArmor Features:**
+* **Cloud-Native**. vArmor follows the Kubernetes Operator design pattern, allowing users to harden specific workloads by manipulating the [CRD API](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/). This approach enables sandboxing of containerized microservices from a perspective closely aligned with business needs.
+* **Multiple Enforcers**. vArmor abstracts AppArmor, BPF, Seccomp, and NetworkProxy as enforcers, supporting their use individually or in combination. This enables enforcing access control on container file access, process execution, network outbound (L3–L7), syscalls, and more.
+* **Network Proxy Enforcer**. vArmor introduces a sidecar-proxy-based enforcer (powered by Envoy) that transparently intercepts and controls container network egress traffic at L4 (TCP), L7 (HTTP/HTTPS), and TLS SNI levels. It supports TLS MITM termination, per-domain HTTP header injection (e.g., API key injection), anti-Domain-Fronting protection, allow-list and deny-list modes, audit logging, and dynamic policy updates without Pod restarts.
+* **AI Agent Protection**. vArmor provides defense-in-depth for AI Agent workloads by combining kernel-level mandatory access control (AppArmor/BPF/Seccomp) with application-protocol-level network access control (NetworkProxy), effectively mitigating risks such as prompt injection-induced tool abuse, key leakage, and unauthorized data exfiltration.
+* **Allow-by-Default**. vArmor currently focuses on supporting this model, where only explicitly declared behaviors will be blocked, which effectively minimizes performance impact and enhances usability. Besides, it supports auditing violations, and these violations can also be allowed rather than blocked.
+* **Built-in Rules**. vArmor features a range of built-in rules ready to use out of the box. They are designed for the Allow-by-Default security model, eliminating the need for expertise in security profile creation.
+* **Behavior Modeling**. vArmor features a range of built-in rules ready to use out of the box. They are designed for the Allow-by-Default security model, eliminating the need for expertise in security profile creation.
+* **Deny-by-Default**. vArmor is capable of using allowlist profiles to harden workloads and provide a more user-friendly approach to develop and manage profiles.
+
+vArmor was created by the **Elkeid Team** of the endpoint security department at ByteDance. And the project is still in active development.
+
+
+## How vArmor works
+
+### Architecture
+vArmor primarily consists of two components: the Manager and the Agent. The Manager is responsible for responding to and managing policy objects, while the Agent handles the management of enforcers and profiles on Nodes.
+
+vArmor also supports the NetworkProxy enforcer, which injects an Envoy sidecar proxy and an init container into target Pods via the mutation webhook. The init container sets up iptables rules to redirect egress traffic to the Envoy sidecar, which then enforces L4/L7 access control policies generated by the Manager and delivered via Secret.
+
+<div style="text-align: center;">
+  <img src="img/architecture.svg" width="1000">
+</div>
+
+### Principle
+* The [VarmorPolicy](getting_started/usage_instructions.md#varmorpolicy) and [VarmorClusterPolicy](getting_started/usage_instructions.md#varmorclusterpolicy) CRs serve as user interfaces.
+* With VarmorPolicy or VarmorClusterPolicy objects, users can harden specific workloads and decide which enforcers and rules to use.
+* The ArmorProfile CR acts as an internal interface used for profile management.
+
+<div style="text-align: center;">
+    <picture>
+        <source media="(prefers-color-scheme: light)" srcset="img/principle.svg">
+        <img src="img/principle-dark.svg">
+    </picture>
+</div>
+
+When the Manager detects the creation event of a VarmorPolicy or VarmorClusterPolicy object, it generates a corresponding internal object called ArmorProfile. The Agent listens for and responds to this ArmorProfile object, processing the profiles and then reporting the status back to the Manager. When a user creates a workload, the APIServer sends the creation request to the Manager through the admission webhook. The Manager evaluates whether the workload should be hardened. If so, the Manager mutates the workload by adding annotations and modifying the securityContext. Finally, the workload's Pod will be scheduled to a Node, and the security context will be set when the container is created.
+
+### Key Terms
+#### The Enforcer
+vArmor abstracts AppArmor, BPF, and Seccomp as enforcers. The policy can use them individually or in combination to harden workloads, such as: AppArmorBPF, AppArmorSeccomp, AppArmorBPFSeccomp etc.
+
+You can specify the enforcer through the `spec.policy.enforcer` field of [VarmorPolicy](getting_started/usage_instructions.md#varmorpolicy) or [VarmorClusterPolicy](getting_started/usage_instructions.md#varmorclusterpolicy) objects. 
+
+#### The Policy Mode
+The vArmor policy can operate in five modes: *AlwaysAllow, RuntimeDefault, EnhanceProtect, BehaviorModeling and DefenseInDepth*. This flexibility allows it to meet the needs of different scenarios.
+
+For more information, please refer to the [Policy Modes](./guides/policies_and_rules/policy_modes/README.md).
+
+#### The Built-in and Custom Rule
+When the policy is running in **EnhanceProtect** mode, [Built-in Rules](./guides/policies_and_rules/built_in_rules.md) and [Custom Rules](./guides/policies_and_rules/custom_rules.md) can be used to harden the container. The policy operates with the **Allow-by-Default** security model, meaning only behaviors explicitly declared will be blocked. This approach minimizes performance impact while enhancing usability.
+
+
+## Prerequisites
+
+The prerequisites required by different enforcers are as shown in the following table.
+
+|Enforcer|Requirements|Recommendations|
+|------------|--------------------------------------------|--------|
+|AppArmor    |1. Linux Kernel 4.15+<br />2. The AppArmor LSM is enabled|GKE with Container-Optimized OS<br />AKS with Ubuntu<br />[VKE](https://www.volcengine.com/product/vke) with veLinux<br />Debian 10 and above<br />Ubuntu 18.04.0 LTS and above<br />[veLinux](https://www.volcengine.com/docs/6396/74967) etc.
+|BPF         |1. Linux Kernel 5.10+ (x86_64) or 6.6+ (arm64)<br />2. containerd v1.6.0+<br />3. The BPF LSM is enabled|EKS with Amazon Linux 2<br />GKE with Container-Optimized OS<br />[VKE](https://www.volcengine.com/product/vke) with veLinux (with 5.10 kernel)<br />AKS with Ubuntu 22.04 LTS <sup>\*</sup><br />ACK with Alibaba Cloud Linux 3 <sup>\*</sup><br />OpenSUSE 15.4 <sup>\*</sup><br />Debian 11 <sup>\*</sup><br />Fedora 37 <br />[veLinux (with 5.10 kernel)](https://www.volcengine.com/docs/6396/74967) etc.<br /><br />* *Manual enabling of BPF LSM is required*
+|Seccomp     |1. Kubernetes v1.19+|All Linux distributions
+|NetworkProxy|-|All Linux distributions
+
+
+## Quick Start
+### Step 1. Fetch chart
+
+```bash
+helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.4
+```
+
+### Step 2. Install
+The default configuration enables the AppArmor and Seccomp enforcers. Please refer to the documentation for more [configuration options](getting_started/installation.md#configuration).
+
+```bash
+helm install varmor varmor-0.10.4.tgz \
+    --namespace varmor --create-namespace \
+    --set image.registry="elkeid-ap-southeast-1.cr.volces.com"
+```
+*You can use the domain `elkeid-cn-beijing.cr.volces.com` inside of the CN region.*
+
+### Step 3. Try with this example
+Create demo namespace.
+
+```bash
+kubectl create namespace demo
+```
+
+Create a VarmorPolicy object to enable the **AlwaysAllow mode** for `deployments` that match the `spec.target.selector`.
+
+```yaml
+cat << EOF | kubectl create -f -
+apiVersion: crd.varmor.org/v1beta1
+kind: VarmorPolicy
+metadata:
+  name: demo-1
+  namespace: demo
+spec:
+  target:
+    kind: Deployment
+    selector:
+      matchLabels:
+        app: demo-1
+  policy:
+    enforcer: AppArmor
+    mode: AlwaysAllow
+EOF
+```
+
+View the status of VarmorPolicy & ArmorProfile object.
+
+```bash
+kubectl get VarmorPolicy -n demo
+kubectl get ArmorProfile -n demo
+```
+
+Create the target Deployment object.
+
+```yaml
+cat << EOF | kubectl create -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-1
+  namespace: demo
+  labels:
+    sandbox.varmor.org/enable: "true"
+    app: demo-1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-1
+  template:
+    metadata:
+      labels:
+        app: demo-1
+      annotations:
+        # Use this annotation to explicitly disable the protection for the container named c0.
+        # It always takes precedence over the '.spec.target.containers' field.
+        container.apparmor.security.beta.varmor.org/c0: unconfined
+    spec:
+      containers:
+      - name: c0
+        image: debian:10
+        command: ["/bin/sh", "-c", "sleep infinity"]
+        imagePullPolicy: IfNotPresent
+      - name: c1
+        image: debian:10
+        command: ["/bin/sh", "-c", "sleep infinity"]
+        imagePullPolicy: IfNotPresent
+
+EOF
+```
+
+Retrieve the Pod name of the target Deployment object.
+
+```bash
+POD_NAME=$(kubectl get Pods -n demo -l app=demo-1 -o name)
+```
+
+Execute a command in container `c1` to read the SA token.
+
+```bash
+kubectl exec -n demo $POD_NAME -c c1 -- cat /run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Switch the VarmorPolicy object to **EnhancedProtect mode** to prohibit the container `c1` from reading the secret token.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: crd.varmor.org/v1beta1
+kind: VarmorPolicy
+metadata:
+  name: demo-1
+  namespace: demo
+spec:
+  target:
+    kind: Deployment
+    selector:
+      matchLabels:
+        app: demo-1
+  policy:
+    enforcer: AppArmor
+    mode: EnhanceProtect
+    enhanceProtect:
+      hardeningRules:
+      - disable-cap-privileged
+      attackProtectionRules:
+      - rules:
+        - mitigate-sa-leak
+EOF
+```
+
+Execute a command in container `c1` to read the SA token and verify that the reading behavior is prohibited.
+
+```bash
+kubectl exec -n demo $POD_NAME -c c1 -- cat /run/secrets/kubernetes.io/serviceaccount/token
+```
+
+## Demo
+Below is a demonstration of using vArmor to harden a Deployment and defend against CVE-2021-22555 (The exploit is modified from [cve-2021-22555](https://github.com/google/security-research/tree/master/pocs/linux/cve-2021-22555)).
+
+For more demos, please check out our GitHub repository [here](https://github.com/bytedance/vArmor/tree/main/test/demos).
+
+![image](../test/demos/CVE-2021-22555/demo.gif)

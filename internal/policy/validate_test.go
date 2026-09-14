@@ -1,0 +1,1277 @@
+// Copyright 2025 vArmor Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package policy
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
+	varmorconfig "github.com/bytedance/vArmor/internal/config"
+)
+
+// TestValidateAddPolicy_ValidVarmorPolicy tests valid VarmorPolicy validation
+func TestValidateAddPolicy_ValidVarmorPolicy(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid policy should pass validation")
+	assert.Equal(t, "", message, "Should return empty message when validation passes")
+}
+
+// TestValidateAddPolicy_ValidVarmorClusterPolicy tests valid VarmorClusterPolicy validation
+func TestValidateAddPolicy_ValidVarmorClusterPolicy(t *testing.T) {
+	policy := &varmor.VarmorClusterPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-cluster-policy",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid cluster policy should pass validation")
+	assert.Equal(t, "", message, "Should return empty message when validation passes")
+}
+
+// TestValidateAddPolicy_UnsupportedPolicyType tests unsupported policy type
+func TestValidateAddPolicy_UnsupportedPolicyType(t *testing.T) {
+	invalidPolicy := "invalid policy type"
+
+	valid, message := ValidateAddPolicy(invalidPolicy, true)
+	assert.False(t, valid, "Unsupported policy type should fail validation")
+	assert.Equal(t, "The policy type is not supported.", message)
+}
+
+// TestValidateAddPolicy_UnsupportedTargetKind tests unsupported target kind
+func TestValidateAddPolicy_UnsupportedTargetKind(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Service", // unsupported type
+				Name: "test-service",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "Unsupported target kind should fail validation")
+	assert.Contains(t, message, "The target kind is not supported")
+}
+
+// TestValidateAddPolicy_EmptyTargetNameAndSelector tests when both target name and selector are empty
+func TestValidateAddPolicy_EmptyTargetNameAndSelector(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				// Both Name and Selector are empty
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "Empty target name and selector should fail validation")
+	assert.Contains(t, message, "The target name and selector are empty")
+}
+
+// TestValidateAddPolicy_BothTargetNameAndSelector tests when both target name and selector are specified
+func TestValidateAddPolicy_BothTargetNameAndSelector(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "Both target name and selector specified should fail validation")
+	assert.Contains(t, message, "The target name and selector are exclusive")
+}
+
+// TestValidateAddPolicy_EnhanceProtectModeWithoutConfig tests EnhanceProtect mode without configuration
+func TestValidateAddPolicy_EnhanceProtectModeWithoutConfig(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.EnhanceProtectMode,
+				// EnhanceProtect is nil
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "EnhanceProtect mode without configuration should fail validation")
+	assert.Contains(t, message, "The enhanceProtect field should be set when the policy runs in the EnhanceProtect mode")
+}
+
+// TestValidateAddPolicy_BehaviorModelingModeWithoutFeature tests BehaviorModeling mode when feature is not enabled
+func TestValidateAddPolicy_BehaviorModelingModeWithoutFeature(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.BehaviorModelingMode,
+			},
+		},
+	}
+
+	// behaviorModelingEnabled = false
+	valid, message := ValidateAddPolicy(policy, false)
+	assert.False(t, valid, "BehaviorModeling mode without feature enabled should fail validation")
+	assert.Contains(t, message, "The BehaviorModeling feature of vArmor is not enabled")
+}
+
+// TestValidateAddPolicy_BehaviorModelingModeWithoutOptions tests BehaviorModeling mode without configuration options
+func TestValidateAddPolicy_BehaviorModelingModeWithoutOptions(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.BehaviorModelingMode,
+				// ModelingOptions is nil
+			},
+		},
+	}
+
+	// behaviorModelingEnabled = true
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "BehaviorModeling mode without configuration options should fail validation")
+	assert.Contains(t, message, "The modelingOptions field should be set when the policy runs in the BehaviorModeling mode")
+}
+
+// TestValidateAddPolicy_ValidBehaviorModelingMode tests valid BehaviorModeling mode
+func TestValidateAddPolicy_ValidBehaviorModelingMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.BehaviorModelingMode,
+				ModelingOptions: &varmor.ModelingOptions{
+					Duration: 30,
+				},
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid BehaviorModeling mode should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateAddPolicy_ValidEnhanceProtectMode tests valid EnhanceProtect mode
+func TestValidateAddPolicy_ValidEnhanceProtectMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.EnhanceProtectMode,
+				EnhanceProtect: &varmor.EnhanceProtect{
+					HardeningRules: []string{"rule1", "rule2"},
+				},
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid EnhanceProtect mode should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateAddPolicy_ValidTargetSelector tests valid target selector
+func TestValidateAddPolicy_ValidTargetSelector(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid target selector should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateAddPolicy_SupportedTargetKinds tests all supported target kinds
+func TestValidateAddPolicy_SupportedTargetKinds(t *testing.T) {
+	supportedKinds := []string{"Deployment", "StatefulSet", "DaemonSet", "Pod"}
+
+	for _, kind := range supportedKinds {
+		t.Run(kind, func(t *testing.T) {
+			policy := &varmor.VarmorPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-policy",
+					Namespace: "default",
+				},
+				Spec: varmor.VarmorPolicySpec{
+					Target: varmor.Target{
+						Kind: kind,
+						Name: "test-workload",
+					},
+					Policy: varmor.Policy{
+						Enforcer: "AppArmor",
+						Mode:     varmor.RuntimeDefaultMode,
+					},
+				},
+			}
+
+			valid, message := ValidateAddPolicy(policy, true)
+			assert.True(t, valid, "Supported target kind %s should pass validation", kind)
+			assert.Equal(t, "", message)
+		})
+	}
+}
+
+// TestValidateAddPolicy_LongPolicyName tests policy name that is too long
+func TestValidateAddPolicy_LongPolicyName(t *testing.T) {
+	// Create a policy with a very long name
+	longName := "this-is-a-very-long-policy-name-that-exceeds-the-kubernetes-name-length-limit-of-63-characters"
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      longName,
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.False(t, valid, "Policy name that is too long should fail validation")
+	assert.Contains(t, message, "The length of policy object name is too long")
+}
+
+// TestValidateAddPolicy_ValidDefenseInDepthMode tests valid DefenseInDepth mode
+func TestValidateAddPolicy_ValidDefenseInDepthMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.DefenseInDepthMode,
+				DefenseInDepth: &varmor.DefenseInDepth{
+					AllowViolations: true,
+				},
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid DefenseInDepth mode should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateAddPolicy_ValidAlwaysAllowMode tests valid AlwaysAllow mode
+func TestValidateAddPolicy_ValidAlwaysAllowMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.AlwaysAllowMode,
+			},
+		},
+	}
+
+	valid, message := ValidateAddPolicy(policy, true)
+	assert.True(t, valid, "Valid AlwaysAllow mode should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateUpdatePolicy_ValidUpdate tests valid policy update
+func TestValidateUpdatePolicy_ValidUpdate(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid policy update should pass validation")
+	assert.Equal(t, "", message, "Validation passes when validation passes")
+}
+
+func TestValidateUpdatePolicy_RemoveNetworkProxyConfig(t *testing.T) {
+	defaultProxyUID := varmorconfig.DefaultProxyUID
+	defaultProxyPort := varmorconfig.DefaultProxyPort
+	defaultProxyAdminPort := varmorconfig.DefaultProxyAdminPort
+	customProxyUID := int64(2000)
+	customProxyPort := uint16(16001)
+	customProxyAdminPort := uint16(16000)
+	tests := []struct {
+		name           string
+		oldProxyConfig *varmor.NetworkProxyConfig
+		valid          bool
+	}{
+		{
+			name:           "implicit defaults",
+			oldProxyConfig: &varmor.NetworkProxyConfig{},
+			valid:          true,
+		},
+		{
+			name: "explicit defaults",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyUID:       &defaultProxyUID,
+				ProxyPort:      &defaultProxyPort,
+				ProxyAdminPort: &defaultProxyAdminPort,
+			},
+			valid: true,
+		},
+		{
+			name: "custom proxy UID",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyUID: &customProxyUID,
+			},
+			valid: false,
+		},
+		{
+			name: "custom proxy port",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyPort: &customProxyPort,
+			},
+			valid: false,
+		},
+		{
+			name: "custom proxy admin port",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyAdminPort: &customProxyAdminPort,
+			},
+			valid: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &varmor.VarmorPolicy{
+				Spec: varmor.VarmorPolicySpec{
+					Target: varmor.Target{
+						Kind: "Deployment",
+						Name: "test-deployment",
+					},
+					Policy: varmor.Policy{
+						Enforcer: "AppArmor",
+						Mode:     varmor.RuntimeDefaultMode,
+					},
+				},
+				Status: varmor.VarmorPolicyStatus{Phase: varmor.VarmorPolicyProtecting},
+			}
+
+			valid, message := ValidateUpdatePolicy(
+				policy,
+				"AppArmor",
+				policy.Spec.Target,
+				tt.oldProxyConfig,
+			)
+			assert.Equal(t, tt.valid, valid)
+			if tt.valid {
+				assert.Empty(t, message)
+			} else {
+				assert.Contains(t, message, "Modifying proxyUID, proxyPort, or proxyAdminPort")
+			}
+		})
+	}
+}
+
+// TestValidateUpdatePolicy_UnsupportedPolicyType tests unsupported policy type
+func TestValidateUpdatePolicy_UnsupportedPolicyType(t *testing.T) {
+	invalidPolicy := "invalid policy type"
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(invalidPolicy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "Unsupported policy type should fail validation")
+	assert.Equal(t, "The policy type is not supported.", message)
+}
+
+// TestValidateUpdatePolicy_TargetModified tests target field modification
+func TestValidateUpdatePolicy_TargetModified(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "modified-deployment", // Modified target name
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment", // Original target name
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "Target field modification should fail validation")
+	assert.Contains(t, message, "Modifying the target field of a policy is not allowed")
+}
+
+// TestValidateUpdatePolicy_SwitchFromBehaviorModelingIncomplete tests switch from BehaviorModeling mode but modeling is not complete
+func TestValidateUpdatePolicy_SwitchFromBehaviorModelingIncomplete(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode, // Switch from BehaviorModeling to RuntimeDefault
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyModeling, // Modeling is not complete
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "Switch from BehaviorModeling mode but modeling is not complete should fail validation")
+	assert.Contains(t, message, "Switching the mode of a policy from BehaviorModeling to others is not allowed")
+}
+
+// TestValidateUpdatePolicy_SwitchFromBehaviorModelingComplete tests switch from BehaviorModeling mode but modeling is complete
+func TestValidateUpdatePolicy_SwitchFromBehaviorModelingComplete(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode, // Switch from BehaviorModeling to RuntimeDefault
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyCompleted, // Modeling is complete
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Switch from BehaviorModeling mode to RuntimeDefault mode should pass validation")
+	assert.Equal(t, "", message, "Validation passes when validation passes")
+}
+
+// TestValidateUpdatePolicy_EnforcerModifiedDuringModeling tests modification of enforcer field during modeling
+func TestValidateUpdatePolicy_EnforcerModifiedDuringModeling(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "BPF", // Modified enforcer
+				Mode:     varmor.BehaviorModelingMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyModeling, // Modeling is not complete
+		},
+	}
+
+	oldEnforcer := "AppArmor" // Original enforcer
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "Modification of enforcer field during modeling should fail validation")
+	assert.Contains(t, message, "Modifying the enforcer field of a policy is not allowed when behavior modeling is still incomplete.")
+}
+
+// TestValidateUpdatePolicy_EnforcerModifiedAfterModeling tests modification of enforcer field after modeling
+func TestValidateUpdatePolicy_EnforcerModifiedAfterModeling(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "SeccompAppArmorBPF", // Modified enforcer
+				Mode:     varmor.BehaviorModelingMode,
+				ModelingOptions: &varmor.ModelingOptions{
+					Duration: 30,
+				},
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyCompleted, // Modeling is complete
+		},
+	}
+
+	oldEnforcer := "AppArmor" // Original enforcer
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Modification of enforcer field after modeling should pass validation")
+	assert.Equal(t, "", message, "Validation passes when validation passes")
+}
+
+// TestValidateUpdatePolicy_RemoveAppArmorEnforcer tests removal of AppArmor enforcer
+func TestValidateUpdatePolicy_RemoveAppArmorEnforcer(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "BPF", // Removed AppArmor
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmorBPF" // Original contains AppArmor and BPF
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "Removal of AppArmor enforcer should fail validation")
+	assert.Contains(t, message, "Modifying a policy to remove the AppArmor or Seccomp enforcer is not allowed")
+}
+
+// TestValidateUpdatePolicy_EnhanceProtectModeWithoutConfig tests EnhanceProtect mode without configuration
+func TestValidateUpdatePolicy_EnhanceProtectModeWithoutConfig(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.EnhanceProtectMode,
+				// EnhanceProtect is nil
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "EnhanceProtect mode without configuration should fail validation")
+	assert.Contains(t, message, "The enhanceProtect field should be set when the policy runs in the EnhanceProtect mode")
+}
+
+// TestValidateUpdatePolicy_BehaviorModelingModeWithoutOptions tests BehaviorModeling mode without configuration options
+func TestValidateUpdatePolicy_BehaviorModelingModeWithoutOptions(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.BehaviorModelingMode,
+				// ModelingOptions is nil
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.False(t, valid, "BehaviorModeling mode without configuration options should fail validation")
+	assert.Contains(t, message, "The modelingOptions field should be set when the policy runs in the BehaviorModeling mode")
+}
+
+// TestValidateUpdatePolicy_ValidVarmorClusterPolicy tests valid VarmorClusterPolicy update
+func TestValidateUpdatePolicy_ValidVarmorClusterPolicy(t *testing.T) {
+	policy := &varmor.VarmorClusterPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-cluster-policy",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid cluster policy update should pass validation")
+	assert.Equal(t, "", message, "Validation passes when validation passes")
+}
+
+// TestValidateUpdatePolicy_ValidEnhanceProtectMode tests valid EnhanceProtect mode update
+func TestValidateUpdatePolicy_ValidEnhanceProtectMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.EnhanceProtectMode,
+				EnhanceProtect: &varmor.EnhanceProtect{
+					HardeningRules: []string{"rule1", "rule2"},
+				},
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid EnhanceProtect mode update should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateUpdatePolicy_ValidBehaviorModelingMode tests valid BehaviorModeling mode update
+func TestValidateUpdatePolicy_ValidBehaviorModelingMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.BehaviorModelingMode,
+				ModelingOptions: &varmor.ModelingOptions{
+					Duration: 30,
+				},
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid BehaviorModeling mode update should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateUpdatePolicy_ValidDefenseInDepthMode tests valid DefenseInDepth mode update
+func TestValidateUpdatePolicy_ValidDefenseInDepthMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.DefenseInDepthMode,
+				DefenseInDepth: &varmor.DefenseInDepth{
+					AllowViolations: true,
+				},
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid DefenseInDepth mode update should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateUpdatePolicy_ValidAlwaysAllowMode tests valid AlwaysAllow mode update
+func TestValidateUpdatePolicy_ValidAlwaysAllowMode(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmor",
+				Mode:     varmor.AlwaysAllowMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor"
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid AlwaysAllow mode update should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// TestValidateUpdatePolicy_ValidEnforcerCombination tests valid enforcer combination update
+func TestValidateUpdatePolicy_ValidEnforcerCombination(t *testing.T) {
+	policy := &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "default",
+		},
+		Spec: varmor.VarmorPolicySpec{
+			Target: varmor.Target{
+				Kind: "Deployment",
+				Name: "test-deployment",
+			},
+			Policy: varmor.Policy{
+				Enforcer: "AppArmorBPF", // AddBPF enforcer
+				Mode:     varmor.RuntimeDefaultMode,
+			},
+		},
+		Status: varmor.VarmorPolicyStatus{
+			Phase: varmor.VarmorPolicyProtecting,
+		},
+	}
+
+	oldEnforcer := "AppArmor" // Original only AppArmor
+	oldTarget := varmor.Target{
+		Kind: "Deployment",
+		Name: "test-deployment",
+	}
+
+	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
+	assert.True(t, valid, "Valid enforcer combination update should pass validation")
+	assert.Equal(t, "", message)
+}
+
+// =============================================================================
+// Tests for containsYAMLUnsafeChars - YAML injection prevention
+// =============================================================================
+
+func TestContainsYAMLUnsafeChars(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		// Safe strings
+		{name: "normal domain", input: "api.openai.com", expected: false},
+		{name: "wildcard domain", input: "*.openai.com", expected: false},
+		{name: "IPv6", input: "2001:db8::1", expected: false},
+		{name: "domain with port", input: "example.com:443", expected: false},
+		{name: "URI path", input: "/api/v1/users", expected: false},
+		{name: "path with query", input: "/search?q=test&page=1", expected: false},
+		{name: "HTTP method", input: "GET", expected: false},
+		{name: "CIDR", input: "10.0.0.0/8", expected: false},
+		{name: "space is safe", input: "hello world", expected: false},
+		{name: "empty string", input: "", expected: false},
+		{name: "Base64 value", input: "dGVzdA==+/abc", expected: false},
+
+		// Unsafe: C0 control characters
+		{name: "contains newline", input: "evil\ninjection", expected: true},
+		{name: "contains CR", input: "evil\rinjection", expected: true},
+		{name: "contains tab", input: "evil\tinjection", expected: true},
+		{name: "contains null", input: "evil\x00injection", expected: true},
+		{name: "contains SOH", input: "evil\x01injection", expected: true},
+		{name: "contains ESC", input: "evil\x1binjection", expected: true},
+		{name: "contains US", input: "evil\x1finjection", expected: true},
+
+		// Unsafe: YAML structural characters
+		{name: "contains double quote", input: "evil\"injection", expected: true},
+		{name: "contains backslash", input: `evil\injection`, expected: true},
+
+		// Unsafe: DEL and YAML 1.1 line breaks
+		{name: "contains DEL", input: "evil\x7finjection", expected: true},
+		{name: "contains NEL U+0085", input: "evil\xc2\x85injection", expected: true},
+		{name: "contains LS U+2028", input: "evil\xe2\x80\xa8injection", expected: true},
+		{name: "contains PS U+2029", input: "evil\xe2\x80\xa9injection", expected: true},
+
+		// Attack patterns
+		{name: "YAML injection via quote+newline", input: "evil\"\nnew_key: true", expected: true},
+		{name: "YAML injection via LS", input: "evil\xe2\x80\xa8new_key: true", expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsYAMLUnsafeChars(tt.input)
+			if got != tt.expected {
+				t.Errorf("containsYAMLUnsafeChars(%q) = %v, want %v", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Tests for ValidateNetworkProxyEgress - webhook validation
+// =============================================================================
+
+func TestValidateNetworkProxyEgress_Nil(t *testing.T) {
+	valid, msg := ValidateNetworkProxyEgress(nil)
+	assert.True(t, valid)
+	assert.Equal(t, "", msg)
+}
+
+func TestValidateNetworkProxyEgress_ValidInput(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Hosts:   []string{"api.openai.com", "*.example.com"},
+					Methods: []string{"GET", "POST"},
+					Paths: []varmor.HTTPPathMatch{
+						{Exact: "/api/v1/users"},
+						{Prefix: "/api/v2/"},
+					},
+				},
+			},
+		},
+		Rules: []varmor.NetworkProxyEgressRule{
+			{
+				IP:   "10.0.0.1",
+				CIDR: "192.168.0.0/16",
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.True(t, valid, "Valid egress should pass: %s", msg)
+}
+
+func TestValidateNetworkProxyEgress_UnsafeHost(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Hosts: []string{"evil\"\ninjection: true"},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafePath(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Paths: []varmor.HTTPPathMatch{
+						{Exact: "/api\ninjection"},
+					},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafeMethod(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Methods: []string{"GET\"\ninjection"},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafeIP(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		Rules: []varmor.NetworkProxyEgressRule{
+			{
+				IP: "10.0.0.1\"\ninjection: true",
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafeCIDR(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		Rules: []varmor.NetworkProxyEgressRule{
+			{
+				CIDR: "10.0.0.0/8\"\ninjection",
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafeNEL(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Hosts: []string{"evil\xc2\x85injection"},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafeLS(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Hosts: []string{"evil\xe2\x80\xa8injection"},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_UnsafePathPrefix(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "deny",
+		HTTPRules: []varmor.NetworkProxyHTTPRule{
+			{
+				Match: varmor.HTTPMatch{
+					Paths: []varmor.HTTPPathMatch{
+						{Prefix: "/api\"\ninjection"},
+					},
+				},
+			},
+		},
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid)
+	assert.Contains(t, msg, "unsafe characters")
+}
+
+func TestValidateNetworkProxyEgress_DefaultActionAllow(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "allow",
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.True(t, valid, "defaultAction \"allow\" should pass: %s", msg)
+}
+
+func TestValidateNetworkProxyEgress_DefaultActionCaseInsensitive(t *testing.T) {
+	for _, action := range []string{"Deny", "DENY", "Allow", "ALLOW"} {
+		egress := &varmor.NetworkProxyEgress{DefaultAction: action}
+		valid, msg := ValidateNetworkProxyEgress(egress)
+		assert.True(t, valid, "defaultAction %q should pass: %s", action, msg)
+	}
+}
+
+func TestValidateNetworkProxyEgress_DefaultActionTypo(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "denny",
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid, "typo defaultAction should be rejected")
+	assert.Contains(t, msg, "defaultAction")
+}
+
+func TestValidateNetworkProxyEgress_DefaultActionEmpty(t *testing.T) {
+	egress := &varmor.NetworkProxyEgress{
+		DefaultAction: "",
+	}
+	valid, msg := ValidateNetworkProxyEgress(egress)
+	assert.False(t, valid, "empty defaultAction should be rejected")
+	assert.Contains(t, msg, "defaultAction")
+}

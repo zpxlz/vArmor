@@ -13,25 +13,41 @@ spec:
     metadata:
       labels:
         {{- include "varmor.agent.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- with .Values.agent.podAnnotations }}
+            {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if semverCompare "<1.30.0-0" .Capabilities.KubeVersion.Version }}
+        container.apparmor.security.beta.kubernetes.io/agent: unconfined
+        {{- end }}
     spec:
       {{- if .Values.image.password }}
       imagePullSecrets:
-      {{- with .Values.imagePullSecrets }}
-      {{- toYaml . | nindent 6 }}
-      {{- end }}
+        {{- with .Values.imagePullSecrets }}
+          {{- toYaml . | nindent 6 }}
+        {{- end }}
       {{- end }}
       serviceAccountName: {{ include "varmor.agent.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.agent.podSecurityContext | nindent 8 }}
+      hostPID: true
+      {{- if .Values.agent.network.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: {{ .Values.agent.network.dnsPolicy }}
+      {{- end}}
       containers:
       - name: {{ .Values.agent.name }}
         image: "{{ .Values.image.registry }}/{{ .Values.image.namespace }}/{{ .Values.agent.image.name }}:{{ .Values.agent.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
         command: ["/varmor/vArmor", "--agent"]
-        {{- if or .Values.agent.args .Values.behaviorModeling.enabled .Values.bpfLsmEnforcer.enabled .Values.unloadAllAaProfiles.enabled .Values.removeAllSeccompProfiles.enabled }}
         args:
           {{- if .Values.agent.args }}
             {{- with .Values.agent.args }}
+              {{- toYaml . | nindent 8 }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.jsonLogFormat.enabled }}
+            {{- with .Values.jsonLogFormat.args }}
               {{- toYaml . | nindent 8 }}
             {{- end }}
           {{- end }}
@@ -55,16 +71,55 @@ spec:
               {{- toYaml . | nindent 8 }}
             {{- end }}
           {{- end }}
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: AGENT_READINESS_PORT
+          value: "{{ .Values.agent.network.readinessPort }}"
+        {{- if .Values.auditEventMetadata }}
+        - name: AUDIT_EVENT_METADATA
+          value: '{{- toJson .Values.auditEventMetadata}}'
         {{- end }}
+        readinessProbe:
+          httpGet:
+            path: /health/readiness
+            port: {{ .Values.agent.network.readinessPort }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
         securityContext:
-          {{- toYaml .Values.agent.securityContext | nindent 10 }}
+          {{- with .Values.agent.securityContext }}
+            {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- if semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version }}
+          appArmorProfile:
+            type: Unconfined
+          {{- end }}
         volumeMounts:
         - mountPath: /sys/kernel/security
           name: securityfs
         - mountPath: /var/lib/kubelet/seccomp
           name: seccomp-dir
+        - mountPath: /run/containerd
+          name: containerd
+        - mountPath: /var/log
+          name: var-log-dir
         - mountPath: /var/run/secrets/tokens
           name: bound-token
+        - mountPath: /var/run/varmor/audit
+          name: varmor-network-proxy-audit
         {{- if .Values.appArmorLsmEnforcer.enabled }}
           {{- with .Values.agent.appArmorLsmEnforcer.volumeMounts }}
             {{- toYaml . | nindent 8 }}
@@ -82,18 +137,12 @@ spec:
         {{- end }}
         resources:
         {{- if .Values.behaviorModeling.enabled }}
-        {{- toYaml .Values.agent.behaviorModeling.resources | nindent 10 }}
+          {{- toYaml .Values.agent.behaviorModeling.resources | nindent 10 }}
         {{- else if .Values.bpfLsmEnforcer.enabled }}
-        {{- toYaml .Values.agent.bpfLsmEnforcer.resources | nindent 10 }}
+          {{- toYaml .Values.agent.bpfLsmEnforcer.resources | nindent 10 }}
         {{- else }}
-        {{- toYaml .Values.agent.appArmorLsmEnforcer.resources | nindent 10 }}
+          {{- toYaml .Values.agent.appArmorLsmEnforcer.resources | nindent 10 }}
         {{- end }}
-        readinessProbe:
-          httpGet:
-            path: /health/readiness
-            port: 6080
-          initialDelaySeconds: 5
-          periodSeconds: 10
       volumes:
       - hostPath:
           path: /sys/kernel/security
@@ -103,13 +152,25 @@ spec:
           path: /var/lib/kubelet/seccomp
           type: DirectoryOrCreate
         name: seccomp-dir
+      - hostPath:
+          path: /run/containerd
+          type: Directory
+        name: containerd
+      - hostPath:
+          path: /var/log
+          type: Directory
+        name: var-log-dir
       - projected:
           sources:
           - serviceAccountToken:
               path: bound-token
-              expirationSeconds: 7200
+              expirationSeconds: 86400
               audience: varmor-manager
         name: bound-token
+      - hostPath:
+          path: /var/run/varmor/audit
+          type: DirectoryOrCreate
+        name: varmor-network-proxy-audit
       {{- if .Values.appArmorLsmEnforcer.enabled }}
         {{- with .Values.agent.appArmorLsmEnforcer.volumes }}
           {{- toYaml . | nindent 6 }}

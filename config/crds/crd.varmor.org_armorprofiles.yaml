@@ -3,8 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.11.3
-  creationTimestamp: null
+    controller-gen.kubebuilder.io/version: v0.17.3
   name: armorprofiles.crd.varmor.org
 spec:
   group: crd.varmor.org
@@ -37,22 +36,29 @@ spec:
     name: v1beta1
     schema:
       openAPIV3Schema:
-        description: ArmorProfile is the Schema for the armorprofiles API
+        description: |-
+          ArmorProfile is the Schema for the armorprofiles API
+          It's an internal interface, used by vArmor only.
         properties:
           apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation
-              of an object. Servers should convert recognized schemas to the latest
-              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
             type: string
           kind:
-            description: 'Kind is a string value representing the REST resource this
-              object represents. Servers may infer this from the endpoint the client
-              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
             type: object
           spec:
-            description: ArmorProfileSpec defines the desired state of ArmorProfile
+            description: Spec defines the profiles for hardening target workloads.
             properties:
               behaviorModeling:
                 properties:
@@ -68,14 +74,27 @@ spec:
                 type: object
               profile:
                 properties:
-                  bpfContent:
+                  appArmor:
+                    type: string
+                  bpf:
                     properties:
                       capabilities:
-                        format: int64
-                        type: integer
+                        properties:
+                          capabilities:
+                            format: int64
+                            type: integer
+                          mode:
+                            format: int32
+                            type: integer
+                        required:
+                        - capabilities
+                        type: object
                       files:
                         items:
                           properties:
+                            mode:
+                              format: int32
+                              type: integer
                             pattern:
                               properties:
                                 flags:
@@ -101,8 +120,11 @@ spec:
                           properties:
                             fstype:
                               type: string
-                            mountFlags:
+                            mode:
                               format: int32
+                              type: integer
+                            mountFlags:
+                              format: int64
                               type: integer
                             pattern:
                               properties:
@@ -117,7 +139,7 @@ spec:
                               - flags
                               type: object
                             reverseMountflags:
-                              format: int32
+                              format: int64
                               type: integer
                           required:
                           - fstype
@@ -130,15 +152,38 @@ spec:
                         items:
                           properties:
                             address:
-                              type: string
-                            cidr:
-                              type: string
+                              properties:
+                                cidr:
+                                  type: string
+                                endPort:
+                                  type: integer
+                                ip:
+                                  type: string
+                                port:
+                                  type: integer
+                                ports:
+                                  items:
+                                    type: integer
+                                  type: array
+                              type: object
                             flags:
                               format: int32
                               type: integer
-                            port:
+                            mode:
                               format: int32
                               type: integer
+                            socket:
+                              properties:
+                                domains:
+                                  format: int64
+                                  type: integer
+                                protocols:
+                                  format: int64
+                                  type: integer
+                                types:
+                                  format: int64
+                                  type: integer
+                              type: object
                           required:
                           - flags
                           type: object
@@ -146,6 +191,9 @@ spec:
                       processes:
                         items:
                           properties:
+                            mode:
+                              format: int32
+                              type: integer
                             pattern:
                               properties:
                                 flags:
@@ -171,20 +219,21 @@ spec:
                           flags:
                             format: int32
                             type: integer
+                          mode:
+                            format: int32
+                            type: integer
                           permissions:
                             format: int32
                             type: integer
                         type: object
                     type: object
-                  content:
-                    type: string
                   enforcer:
                     type: string
                   mode:
                     type: string
                   name:
                     type: string
-                  seccompContent:
+                  seccomp:
                     type: string
                 required:
                 - enforcer
@@ -192,69 +241,70 @@ spec:
                 - name
                 type: object
               target:
-                description: Target Structure
                 properties:
                   containers:
-                    description: Containers are used to specify the names of the protected
-                      containers. If it is empty, sandbox protection will be enabled
-                      for all containers within the workload (excluding initContainers
-                      and ephemeralContainers).
+                    description: |-
+                      containers are used to specify the names of the containers. If it is empty, sandbox protection
+                      will be enabled for all containers within the workload (excluding initContainers and ephemeralContainers).
                     items:
                       type: string
                     type: array
                   kind:
-                    description: 'Kind is used to specify the type of workloads for
-                      the protection targets. Available values: Deployment, StatefulSet,
-                      DaemonSet, Pod.'
+                    description: |-
+                      kind is used to specify the type of workloads for the protection targets.
+                      Available values: Deployment, StatefulSet, DaemonSet, Pod.
                     type: string
                   name:
-                    description: Name is used to specify a specific workload name.
+                    description: |-
+                      name is used to specify a specific workload in the policy's namespace or all namespace.
                       Note that the name field and selector field are mutually exclusive.
                     type: string
                   selector:
-                    description: "LabelSelector is used to match workloads that meet
-                      the specified conditions \n Note: The type of workloads is determined
-                      by the KIND field."
+                    description: |-
+                      selector is a label selector which selects workloads in the policy's namespace or all namespace.
+                      This field follows standard label selector semantics.
+                      Note that the selector field and name field are mutually exclusive.
                     properties:
                       matchExpressions:
                         description: matchExpressions is a list of label selector
                           requirements. The requirements are ANDed.
                         items:
-                          description: A label selector requirement is a selector
-                            that contains values, a key, and an operator that relates
-                            the key and values.
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
                           properties:
                             key:
                               description: key is the label key that the selector
                                 applies to.
                               type: string
                             operator:
-                              description: operator represents a key's relationship
-                                to a set of values. Valid operators are In, NotIn,
-                                Exists and DoesNotExist.
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
                               type: string
                             values:
-                              description: values is an array of string values. If
-                                the operator is In or NotIn, the values array must
-                                be non-empty. If the operator is Exists or DoesNotExist,
-                                the values array must be empty. This array is replaced
-                                during a strategic merge patch.
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
                               items:
                                 type: string
                               type: array
+                              x-kubernetes-list-type: atomic
                           required:
                           - key
                           - operator
                           type: object
                         type: array
+                        x-kubernetes-list-type: atomic
                       matchLabels:
                         additionalProperties:
                           type: string
-                        description: matchLabels is a map of {key,value} pairs. A
-                          single {key,value} in the matchLabels map is equivalent
-                          to an element of matchExpressions, whose key field is "key",
-                          the operator is "In", and the values array contains only
-                          "value". The requirements are ANDed.
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
                         type: object
                     type: object
                     x-kubernetes-map-type: atomic
@@ -269,9 +319,11 @@ spec:
             - updateExistingWorkloads
             type: object
           status:
-            description: ArmorProfileStatus defines the observed state of ArmorProfile
+            description: Status defines the observed state of ArmorProfile
             properties:
               conditions:
+                description: Conditions is a list of conditions that describe the
+                  state of the ArmorProfile.
                 items:
                   properties:
                     lastTransitionTime:
@@ -284,6 +336,8 @@ spec:
                         the transition.
                       type: string
                     nodeName:
+                      description: NodeName is the name of the node where the condition
+                        is applicable.
                       type: string
                     reason:
                       description: The reason for the condition's last transition.
@@ -292,7 +346,7 @@ spec:
                       description: Status of the condition, one of True, False, Unknown.
                       type: string
                     type:
-                      description: Type of ArmorProfile condition.
+                      description: Type of condition.
                       type: string
                   required:
                   - nodeName
@@ -301,8 +355,14 @@ spec:
                   type: object
                 type: array
               currentNumberLoaded:
+                description: CurrentNumberLoaded is the current number of profiles
+                  that are loaded.
+                format: int32
                 type: integer
               desiredNumberLoaded:
+                description: DesiredNumberLoaded is the desired number of profiles
+                  that should be loaded.
+                format: int32
                 type: integer
             required:
             - currentNumberLoaded

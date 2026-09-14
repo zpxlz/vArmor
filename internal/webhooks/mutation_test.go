@@ -25,7 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
-	varmortypes "github.com/bytedance/vArmor/internal/types"
+	varmorpolicy "github.com/bytedance/vArmor/internal/policy"
 )
 
 func Test_buildPatch(t *testing.T) {
@@ -44,7 +44,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentAllContainersConfined",
 			kind:             "Deployment",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "add", "path": "/spec/template/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test2", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -87,7 +87,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfined",
 			kind:             "Deployment",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -132,7 +132,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentAllContainersAppArmorUnconfined",
 			kind:             "Deployment",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -177,7 +177,7 @@ func Test_buildPatch(t *testing.T) {
 		{
 			name:             "patchDeploymentNoContainersConfined",
 			kind:             "Deployment",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			enforcer:         "AppArmor",
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
@@ -225,7 +225,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodAllContainersConfined",
 			kind:             "Pod",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -257,7 +257,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodPartContainerConfined",
 			kind:             "Pod",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -289,7 +289,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodNoContainersConfined",
 			kind:             "Pod",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   "",
@@ -323,7 +323,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfinedWithBPFAndExclusiveMode",
 			kind:             "Deployment",
 			enforcer:         "BPF",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: true,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.bpf.security.beta.varmor.org~1c1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1c1", "value": "unconfined"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -365,7 +365,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfinedWithBPF",
 			kind:             "Deployment",
 			enforcer:         "BPF",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.bpf.security.beta.varmor.org~1c1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -407,7 +407,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodAllContainersSeccomp",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -441,7 +441,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "overridePodAllContainersSeccomp",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -477,7 +477,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "overridePodAllContainersSeccompInRuntimeDefault",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.RuntimeDefaultMode,
+			mode:             varmor.RuntimeDefaultMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "RuntimeDefault"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "RuntimeDefault"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -513,7 +513,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodOneContainerSeccomp",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -551,7 +551,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "notPatchPrivilegedContainerSeccomp",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -587,7 +587,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentOneContainerSeccomp",
 			kind:             "Deployment",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -631,7 +631,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchSeccompWithAlwaysAllowMode",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.AlwaysAllowMode,
+			mode:             varmor.AlwaysAllowMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -665,7 +665,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchSeccompWithRuntimeDefaultMode",
 			kind:             "Pod",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.RuntimeDefaultMode,
+			mode:             varmor.RuntimeDefaultMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "RuntimeDefault"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -704,7 +704,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "onlyPatchDeploymentPartContainerConfinedWithAppArmorSeccomp",
 			kind:             "Deployment",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test2", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -750,7 +750,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfinedWithAppArmorSeccomp",
 			kind:             "Deployment",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.kubernetes.io~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/0/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -795,7 +795,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentAllContainersSeccompUnconfined",
 			kind:             "Deployment",
 			enforcer:         "Seccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       false,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -841,7 +841,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodAllContainersAppArmorOnK8s130",
 			kind:             "Pod",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.varmor.org~1test", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/1/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -875,7 +875,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodOneContainerAppArmorOnK8s130",
 			kind:             "Pod",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/1/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -913,7 +913,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentOneContainerAppArmorOnK8s130",
 			kind:             "Deployment",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -957,7 +957,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentOneContainerAppArmorOnK8s1302",
 			kind:             "Deployment",
 			enforcer:         "AppArmor",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -1000,7 +1000,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "onlyPatchDeploymentPartContainerConfinedWithAppArmorSeccompOnK8s130",
 			kind:             "Deployment",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -1046,7 +1046,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfinedWithAppArmorSeccompOnK8s130",
 			kind:             "Deployment",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/0/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/1/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -1091,7 +1091,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchDeploymentPartContainerConfinedWithAppArmorSeccompOnK8s1302",
 			kind:             "Deployment",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "add", "path": "/spec/template/metadata/annotations", "value": {}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/template/spec/containers/0/securityContext", "value": {}},{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/spec/template/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -1137,7 +1137,7 @@ func Test_buildPatch(t *testing.T) {
 			name:             "patchPodPartContainerConfinedWithAppArmorSeccompOnK8s130",
 			kind:             "Pod",
 			enforcer:         "AppArmorSeccomp",
-			mode:             varmortypes.EnhanceProtectMode,
+			mode:             varmor.EnhanceProtectMode,
 			bpfExclusiveMode: false,
 			apparmorGA:       true,
 			expectedResult:   `[{"op": "add", "path": "/metadata/annotations", "value": {}},{"op": "replace", "path": "/metadata/annotations/container.apparmor.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "add", "path": "/spec/containers/0/securityContext", "value": {}},{"op": "replace", "path": "/spec/containers/0/securityContext/appArmorProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test1", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/0/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/container.seccomp.security.beta.varmor.org~1test2", "value": "localhost/varmor-testns-test"},{"op": "replace", "path": "/spec/containers/1/securityContext/seccompProfile", "value": {"type": "Localhost", "localhostProfile": "varmor-testns-test"}},{"op": "replace", "path": "/metadata/annotations/webhook.varmor.org~1mutatedAt", "value": "TIME_STRING"}]`,
@@ -1187,7 +1187,7 @@ func Test_buildPatch(t *testing.T) {
 				assert.NilError(t, err)
 
 				deploy := obj.(*appsv1.Deployment)
-				patch, err := buildPatch(deploy, tc.enforcer, tc.mode, target, profileName, tc.bpfExclusiveMode, tc.apparmorGA)
+				patch, err := buildPatch(deploy, tc.enforcer, tc.mode, target, nil, profileName, varmorpolicy.AuditPolicyIdentity{}, tc.bpfExclusiveMode, tc.apparmorGA)
 				if err != nil {
 					assert.Assert(t, err != nil)
 				}
@@ -1203,7 +1203,7 @@ func Test_buildPatch(t *testing.T) {
 				assert.NilError(t, err)
 
 				pod := obj.(*corev1.Pod)
-				patch, err := buildPatch(pod, tc.enforcer, tc.mode, target, profileName, tc.bpfExclusiveMode, tc.apparmorGA)
+				patch, err := buildPatch(pod, tc.enforcer, tc.mode, target, nil, profileName, varmorpolicy.AuditPolicyIdentity{}, tc.bpfExclusiveMode, tc.apparmorGA)
 				if err != nil {
 					assert.Assert(t, err != nil)
 				}

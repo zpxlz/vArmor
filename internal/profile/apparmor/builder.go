@@ -15,7 +15,6 @@
 package apparmor
 
 import (
-	"encoding/base64"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,12 +23,12 @@ import (
 	varmorutils "github.com/bytedance/vArmor/internal/utils"
 )
 
-func buildExecRules(dynamicResult *varmor.DynamicResult) string {
+func buildExecRules(appArmor *varmor.AppArmor) string {
 	ruleSet := "\n  # ---- EXEC ----\n"
 
-	rules := make([]string, 0, len(dynamicResult.AppArmor.Executions))
+	rules := make([]string, 0, len(appArmor.Executions))
 
-	for _, exec := range dynamicResult.AppArmor.Executions {
+	for _, exec := range appArmor.Executions {
 		rule := fmt.Sprintf("  %s ix,\n", exec)
 		rules = append(rules, rule)
 	}
@@ -40,12 +39,12 @@ func buildExecRules(dynamicResult *varmor.DynamicResult) string {
 	return ruleSet
 }
 
-func buildFileRules(dynamicResult *varmor.DynamicResult) string {
+func buildFileRules(appArmor *varmor.AppArmor) string {
 	ruleSet := "\n  # ---- FILE ----\n"
 
-	rules := make([]string, 0, len(dynamicResult.AppArmor.Files))
+	rules := make([]string, 0, len(appArmor.Files))
 
-	for _, file := range dynamicResult.AppArmor.Files {
+	for _, file := range appArmor.Files {
 		if varmorutils.InStringArray("a", file.Permissions) && varmorutils.InStringArray("w", file.Permissions) {
 			perm := make([]string, 0, len(file.Permissions))
 			for _, p := range file.Permissions {
@@ -72,12 +71,12 @@ func buildFileRules(dynamicResult *varmor.DynamicResult) string {
 	return ruleSet
 }
 
-func buildCapabilityRules(dynamicResult *varmor.DynamicResult) string {
+func buildCapabilityRules(appArmor *varmor.AppArmor) string {
 	ruleSet := "\n  # ---- CAPABILITY ----\n"
 
-	rules := make([]string, 0, len(dynamicResult.AppArmor.Capabilities))
+	rules := make([]string, 0, len(appArmor.Capabilities))
 
-	for _, cap := range dynamicResult.AppArmor.Capabilities {
+	for _, cap := range appArmor.Capabilities {
 		rule := fmt.Sprintf("  capability %s,\n", cap)
 		rules = append(rules, rule)
 	}
@@ -88,19 +87,19 @@ func buildCapabilityRules(dynamicResult *varmor.DynamicResult) string {
 	return ruleSet
 }
 
-func buildNetworkRules(dynamicResult *varmor.DynamicResult, debug bool) string {
+func buildNetworkRules(appArmor *varmor.AppArmor, debug bool) string {
 	ruleSet := "\n  # ---- NETWORK ----\n"
 
-	if debug && len(dynamicResult.AppArmor.Networks) > 0 {
-		rules := make([]string, 0, len(dynamicResult.AppArmor.Networks))
-		for _, net := range dynamicResult.AppArmor.Networks {
+	if debug && appArmor.Network != nil && len(appArmor.Network.Sockets) > 0 {
+		rules := make([]string, 0, len(appArmor.Network.Sockets))
+		for _, net := range appArmor.Network.Sockets {
 			var rule string
-			if net.SockType != "" {
-				rule = fmt.Sprintf("  network %s %s,\n", net.Family, net.SockType)
+			if net.Type != "" {
+				rule = fmt.Sprintf("  network %s %s,\n", net.Domain, net.Type)
 			} else if net.Protocol != "" {
-				rule = fmt.Sprintf("  network %s %s,\n", net.Family, net.Protocol)
+				rule = fmt.Sprintf("  network %s %s,\n", net.Domain, net.Protocol)
 			} else {
-				rule = fmt.Sprintf("  network %s,\n", net.Family)
+				rule = fmt.Sprintf("  network %s,\n", net.Domain)
 			}
 			rules = append(rules, rule)
 		}
@@ -113,7 +112,7 @@ func buildNetworkRules(dynamicResult *varmor.DynamicResult, debug bool) string {
 	return ruleSet
 }
 
-func buildPtraceRules(dynamicResult *varmor.DynamicResult, profileName string, debug bool) string {
+func buildPtraceRules(appArmor *varmor.AppArmor, profileName string, debug bool) string {
 	ruleSet := "\n  # ---- PTRACE ----\n"
 
 	// From docker-default profile, See:
@@ -123,11 +122,11 @@ func buildPtraceRules(dynamicResult *varmor.DynamicResult, profileName string, d
 	ruleSet += fmt.Sprintf("  ptrace (trace,read,tracedby,readby) peer=%s,\n", profileName)
 
 	// From audit logs
-	if debug && len(dynamicResult.AppArmor.Ptraces) > 0 {
+	if debug && len(appArmor.Ptraces) > 0 {
 		ruleSet += "  ## only for debug\n"
 
-		rules := make([]string, 0, len(dynamicResult.AppArmor.Ptraces))
-		for _, ptrace := range dynamicResult.AppArmor.Ptraces {
+		rules := make([]string, 0, len(appArmor.Ptraces))
+		for _, ptrace := range appArmor.Ptraces {
 			rule := fmt.Sprintf("  ptrace (%s) peer=%s,\n", strings.Join(ptrace.Permissions, ","), ptrace.Peer)
 			rules = append(rules, rule)
 		}
@@ -138,7 +137,7 @@ func buildPtraceRules(dynamicResult *varmor.DynamicResult, profileName string, d
 	return ruleSet
 }
 
-func buildSignalRules(dynamicResult *varmor.DynamicResult, profileName string, debug bool) string {
+func buildSignalRules(appArmor *varmor.AppArmor, profileName string, debug bool) string {
 	ruleSet := "\n  # ---- SIGNAL ----\n"
 
 	// From docker-default profile
@@ -150,11 +149,11 @@ func buildSignalRules(dynamicResult *varmor.DynamicResult, profileName string, d
 	ruleSet += fmt.Sprintf("  signal (send,receive) peer=%s,\n", profileName)
 
 	// From audit logs
-	if debug && len(dynamicResult.AppArmor.Signals) > 0 {
+	if debug && len(appArmor.Signals) > 0 {
 		ruleSet += "  ## only for debug\n"
 
-		rules := make([]string, 0, len(dynamicResult.AppArmor.Signals))
-		for _, signal := range dynamicResult.AppArmor.Signals {
+		rules := make([]string, 0, len(appArmor.Signals))
+		for _, signal := range appArmor.Signals {
 			rule := fmt.Sprintf("  signal (%s) set=(%s) peer=%s,\n",
 				strings.Join(signal.Permissions, ","),
 				strings.Join(signal.Signals, ","),
@@ -176,22 +175,22 @@ func buildDefaultAllowRules() string {
 	return ruleSet
 }
 
-func GenerateProfileWithBehaviorModel(dynamicResult *varmor.DynamicResult, debug bool) (string, error) {
-	if len(dynamicResult.AppArmor.Profiles) == 0 {
+func GenerateProfileWithBehaviorModel(appArmor *varmor.AppArmor, debug bool) (string, error) {
+	if len(appArmor.Profiles) == 0 {
 		return "", fmt.Errorf("no behavior information found for the target container")
-	} else if len(dynamicResult.AppArmor.Profiles) == 1 {
-		profileName := dynamicResult.AppArmor.Profiles[0]
+	} else if len(appArmor.Profiles) == 1 {
+		profileName := appArmor.Profiles[0]
 
-		ruleSet := buildExecRules(dynamicResult)
-		ruleSet += buildFileRules(dynamicResult)
-		ruleSet += buildCapabilityRules(dynamicResult)
-		ruleSet += buildNetworkRules(dynamicResult, debug)
-		ruleSet += buildPtraceRules(dynamicResult, profileName, debug)
-		ruleSet += buildSignalRules(dynamicResult, profileName, debug)
+		ruleSet := buildExecRules(appArmor)
+		ruleSet += buildFileRules(appArmor)
+		ruleSet += buildCapabilityRules(appArmor)
+		ruleSet += buildNetworkRules(appArmor, debug)
+		ruleSet += buildPtraceRules(appArmor, profileName, debug)
+		ruleSet += buildSignalRules(appArmor, profileName, debug)
 		ruleSet += buildDefaultAllowRules()
 
 		profile := fmt.Sprintf(defenseInDepthTemplate, profileName, ruleSet)
-		return base64.StdEncoding.EncodeToString([]byte(profile)), nil
+		return profile, nil
 	} else {
 		return "", fmt.Errorf("fatal error: more than one profile exists or profile name is unexpected")
 	}
